@@ -1,0 +1,13 @@
+# Environment
+.env
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Vector DB
+chroma_db/
+
+# macOS
+.DS_Store
