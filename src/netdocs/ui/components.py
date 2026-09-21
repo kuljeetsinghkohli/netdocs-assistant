@@ -132,6 +132,9 @@ def render_ask_response(result: AskResult, *, show_debug: bool = False) -> None:
                 icon="⚠️",
             )
         else:
+            # The answer already contains a rendered Sources block; render it
+            # directly.  The separate _render_citations expander below provides
+            # an interactive drill-down per source.
             st.markdown(result.answer)
 
         if result.citations:
@@ -169,15 +172,21 @@ def render_agent_response(
 
 
 def _render_citations(citations: list[Citation]) -> None:
-    """Render each citation as an expandable source snippet."""
+    """Render each citation as an expandable source snippet.
+
+    Uses the citation's ``number`` field (assigned by the generator in
+    first-use order) so the ``[N]`` labels here match those in the answer text.
+    Falls back to the list position if ``number`` is 0 (e.g. old API responses).
+    """
     if not citations:
         return
 
     st.markdown("---")
     st.caption(f"📄 {len(citations)} source{'s' if len(citations) != 1 else ''}")
 
-    for idx, cit in enumerate(citations, start=1):
-        label = f"[{idx}] {cit.source_file or cit.doc_id}  —  *{cit.section}*"
+    for pos, cit in enumerate(citations, start=1):
+        num = cit.number if cit.number else pos
+        label = f"[{num}] {cit.source_file or cit.doc_id}  —  *{cit.section}*"
         with st.expander(label, expanded=False):
             col1, col2 = st.columns([1, 3])
             with col1:

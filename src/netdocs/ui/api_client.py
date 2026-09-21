@@ -26,6 +26,7 @@ class Citation:
     section: str
     source_file: str
     doc_type: str
+    number: int = 0
 
 
 @dataclass
@@ -145,6 +146,7 @@ class NetDocsClient:
                 section=c.get("section", ""),
                 source_file=c.get("source_file", ""),
                 doc_type=c.get("doc_type", ""),
+                number=c.get("number", 0),
             )
             for c in data.get("citations", [])
         ]

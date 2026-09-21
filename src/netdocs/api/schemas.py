@@ -67,6 +67,7 @@ class CitationOut(BaseModel):
     section: str
     source_file: str
     doc_type: str
+    number: int = Field(default=0, description="1-based citation number in order of first use.")
 
 
 class AskResponse(BaseModel):

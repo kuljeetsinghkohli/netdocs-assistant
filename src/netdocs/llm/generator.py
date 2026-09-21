@@ -52,12 +52,14 @@ class Citation:
         section:      Section heading extracted from the chunk's metadata.
         source_file:  Originating file path.
         doc_type:     Document type (design_doc, runbook, ticket, config).
+        number:       1-based citation number assigned in order of first use.
     """
 
     doc_id: str
     section: str = ""
     source_file: str = ""
     doc_type: str = ""
+    number: int = 0
 
 
 @dataclass
@@ -143,12 +145,16 @@ def _parse_citations(
 ) -> list[Citation]:
     """Extract ``[doc:...]`` tokens from the answer and map to chunk metadata.
 
+    Citations are numbered in order of first appearance (``number=1``, ``2``, …).
+    A ``doc_id`` that appears more than once keeps a single entry.
+
     Args:
         answer: The raw LLM answer text.
         chunks: Context chunks used to build the answer.
 
     Returns:
-        Deduplicated list of :class:`Citation` objects in order of appearance.
+        Deduplicated list of :class:`Citation` objects in order of appearance,
+        with ``number`` set to the 1-based first-use order.
     """
     id_to_chunk: dict[str, dict[str, Any]] = {c["id"]: c for c in chunks}
     seen: set[str] = set()
@@ -178,38 +184,50 @@ def _parse_citations(
                 ),
                 source_file=meta.get("source_file", ""),
                 doc_type=meta.get("doc_type", ""),
+                number=len(citations) + 1,
             )
         )
     return citations
 
 
 def render_citations(answer: str, citations: list[Citation]) -> str:
-    """Replace raw ``[doc:<id>:<section>]`` tokens with readable markers.
+    """Replace raw ``[doc:<id>:<section>]`` tokens with numbered markers.
 
-    Transforms ``text [doc:RB-001__002:Step 1]`` into
-    ``text [Step 1 — RB-001__002]``, eliminating stray `` .`` artefacts
-    that appeared when citations were stripped without substitution.
+    Assigns each unique ``doc_id`` a sequential number in order of first
+    appearance (``[1]``, ``[2]``, …) and replaces every ``[doc:...]`` token
+    with the corresponding number marker.  A ``Sources:`` block listing each
+    number → file name and section is appended at the end of the answer.
 
     Args:
         answer:    Raw answer text containing ``[doc:...]`` tokens.
-        citations: Parsed citation list (used for section name lookup).
+        citations: Parsed, deduplicated citation list (in first-use order),
+                   with ``number`` already assigned by :func:`_parse_citations`.
 
     Returns:
-        Answer with citation tokens replaced by readable ``[section — id]`` markers.
+        Answer with citation tokens replaced by ``[N]`` markers and a
+        ``Sources:`` list appended.
     """
-    id_to_section: dict[str, str] = {c.doc_id: c.section for c in citations}
+    id_to_number: dict[str, int] = {c.doc_id: c.number for c in citations}
 
     def _replace(m: re.Match) -> str:  # type: ignore[type-arg]
         raw = m.group(1)
-        parts = raw.split(":", 1)
-        doc_id = parts[0].strip()
-        section = parts[1].strip() if len(parts) > 1 else ""
-        section = section or id_to_section.get(doc_id, "")
-        if section:
-            return f"[{section} — {doc_id}]"
+        doc_id = raw.split(":", 1)[0].strip()
+        num = id_to_number.get(doc_id)
+        if num is not None:
+            return f"[{num}]"
         return f"[{doc_id}]"
 
-    return _CITATION_RE.sub(_replace, answer)
+    rendered = _CITATION_RE.sub(_replace, answer)
+
+    if citations:
+        lines = ["\n\n**Sources:**"]
+        for cit in citations:
+            label = cit.source_file or cit.doc_id
+            section_part = f" — {cit.section}" if cit.section else ""
+            lines.append(f"[{cit.number}] {label}{section_part}")
+        rendered = rendered + "\n".join(lines)
+
+    return rendered
 
 
 def _top_confidence(chunks: list[dict[str, Any]]) -> float:

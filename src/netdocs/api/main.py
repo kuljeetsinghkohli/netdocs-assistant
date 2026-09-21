@@ -149,6 +149,7 @@ async def ask(request: AskRequest) -> AskResponse:
                 section=c.section,
                 source_file=c.source_file,
                 doc_type=c.doc_type,
+                number=c.number,
             )
             for c in result.citations
         ],

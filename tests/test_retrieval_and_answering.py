@@ -1251,30 +1251,33 @@ class TestRefusalReason:
 # ---------------------------------------------------------------------------
 
 class TestCitationRendering:
-    def test_renders_doc_id_and_section(self):
+    def test_renders_numbered_marker(self):
+        """[doc:...] tokens are replaced by [N] numbered markers."""
         from netdocs.llm.generator import render_citations, Citation
 
-        citations = [Citation(doc_id="RB-001__002", section="Step 1 — Confirm the Flap")]
+        citations = [Citation(doc_id="RB-001__002", section="Step 1 — Confirm the Flap", number=1)]
         answer = "Run show bgp summary. [doc:RB-001__002:Step 1 — Confirm the Flap]"
         rendered = render_citations(answer, citations)
         assert "[doc:" not in rendered
-        assert "[Step 1 — Confirm the Flap — RB-001__002]" in rendered
+        assert "[1]" in rendered
 
     def test_no_stray_period_space(self):
         from netdocs.llm.generator import render_citations, Citation
 
-        citations = [Citation(doc_id="DD-003__001", section="BGP Overview")]
+        citations = [Citation(doc_id="DD-003__001", section="BGP Overview", number=1)]
         answer = "The hold timer is 90s [doc:DD-003__001:BGP Overview]."
         rendered = render_citations(answer, citations)
         assert " ." not in rendered
 
-    def test_citation_without_section_uses_lookup(self):
+    def test_sources_block_contains_section(self):
+        """The appended Sources block lists the section name."""
         from netdocs.llm.generator import render_citations, Citation
 
-        citations = [Citation(doc_id="DD-003__001", section="My Section")]
+        citations = [Citation(doc_id="DD-003__001", section="My Section", number=1)]
         answer = "Some text [doc:DD-003__001]."
         rendered = render_citations(answer, citations)
-        assert "[My Section — DD-003__001]" in rendered
+        assert "My Section" in rendered
+        assert "**Sources:**" in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -1505,3 +1508,96 @@ class TestBGPRunbookPreambleFix:
             assert f"{step_n}." in text, (
                 f"Step {step_n} missing from preamble TOC in __000"
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Numbered citations
+# ---------------------------------------------------------------------------
+
+class TestNumberedCitations:
+    """Verify that citations are numbered in first-use order and that a
+    doc_id cited more than once keeps a single number."""
+
+    def _chunks(self):
+        return [
+            _make_chunk("DD-003__002", text="BGP policy text", section="BGP Communities"),
+            _make_chunk("RB-001__001", text="BGP flap runbook", doc_type="runbook", section="Step 3"),
+        ]
+
+    def test_numbers_assigned_in_first_use_order(self):
+        from netdocs.llm.generator import _parse_citations
+
+        answer = (
+            "The hold timer is 90s [doc:DD-003__002:BGP Communities]. "
+            "See also [doc:RB-001__001:Step 3] for recovery steps."
+        )
+        cits = _parse_citations(answer, self._chunks())
+        assert len(cits) == 2
+        assert cits[0].number == 1
+        assert cits[1].number == 2
+
+    def test_second_source_cited_first_gets_number_one(self):
+        from netdocs.llm.generator import _parse_citations
+
+        # RB-001__001 appears before DD-003__002 in the answer text
+        answer = (
+            "See [doc:RB-001__001:Step 3] first, "
+            "then [doc:DD-003__002:BGP Communities]."
+        )
+        cits = _parse_citations(answer, self._chunks())
+        assert cits[0].doc_id == "RB-001__001"
+        assert cits[0].number == 1
+        assert cits[1].doc_id == "DD-003__002"
+        assert cits[1].number == 2
+
+    def test_duplicate_citation_keeps_single_number(self):
+        from netdocs.llm.generator import _parse_citations
+
+        answer = (
+            "[doc:DD-003__002] mentioned here and again [doc:DD-003__002] later."
+        )
+        cits = _parse_citations(answer, self._chunks())
+        assert len(cits) == 1
+        assert cits[0].number == 1
+
+    def test_render_replaces_tokens_with_numbers(self):
+        from netdocs.llm.generator import _parse_citations, render_citations
+
+        answer = (
+            "The hold timer is 90s [doc:DD-003__002:BGP Communities]. "
+            "See also [doc:RB-001__001:Step 3] for recovery."
+        )
+        cits = _parse_citations(answer, self._chunks())
+        rendered = render_citations(answer, cits)
+        assert "[1]" in rendered
+        assert "[2]" in rendered
+        # Raw chunk IDs must not appear as inline markers
+        assert "[doc:DD-003__002" not in rendered
+        assert "[doc:RB-001__001" not in rendered
+
+    def test_sources_block_appended(self):
+        from netdocs.llm.generator import _parse_citations, render_citations
+
+        answer = "Answer [doc:DD-003__002:BGP Communities]."
+        cits = _parse_citations(answer, self._chunks())
+        rendered = render_citations(answer, cits)
+        assert "**Sources:**" in rendered
+        # The sources block must include the source file and section
+        assert "[1]" in rendered
+        assert "BGP Communities" in rendered
+
+    def test_duplicate_in_render_replaced_consistently(self):
+        from netdocs.llm.generator import _parse_citations, render_citations
+
+        answer = (
+            "First mention [doc:DD-003__002:BGP Communities] "
+            "and second mention [doc:DD-003__002:BGP Communities]."
+        )
+        cits = _parse_citations(answer, self._chunks())
+        rendered = render_citations(answer, cits)
+        # Split into the answer body and the Sources block
+        body, _, sources_section = rendered.partition("**Sources:**")
+        # Both inline occurrences should be [1]
+        assert body.count("[1]") == 2
+        # The sources list itself has exactly one entry for this source
+        assert sources_section.count("[1]") == 1
