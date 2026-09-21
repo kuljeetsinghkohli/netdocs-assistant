@@ -175,3 +175,27 @@ class VectorStore:
         """Return all document IDs."""
         result = self._collection.get(include=[])
         return result["ids"] or []
+
+    def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        """Fetch documents by their IDs.
+
+        Args:
+            ids: List of document IDs to retrieve.
+
+        Returns:
+            List of dicts with keys ``id``, ``text``, ``metadata``.
+        """
+        if not ids:
+            return []
+        result = self._collection.get(
+            ids=ids,
+            include=["documents", "metadatas"],
+        )
+        output: list[dict[str, Any]] = []
+        for doc_id, text, meta in zip(
+            result["ids"],
+            result["documents"],
+            result["metadatas"],
+        ):
+            output.append({"id": doc_id, "text": text, "metadata": meta})
+        return output

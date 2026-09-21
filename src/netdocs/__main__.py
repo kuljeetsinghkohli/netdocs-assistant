@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 """
-CLI entry point — ``python -m netdocs ingest``.
+CLI entry point — ``python -m netdocs``.
 
-Usage::
+Sub-commands::
 
-    python -m netdocs ingest [--data-dir PATH] [--reset]
-
-Options:
-    --data-dir PATH   Override the raw data directory (default: data/raw).
-    --reset           Drop and recreate the ChromaDB collection before ingesting.
-    --dry-run         Parse and chunk files without embedding or writing to ChromaDB.
+    python -m netdocs ingest [--data-dir PATH] [--reset] [--dry-run]
+    python -m netdocs ask "your question here" [--doc-type TYPE] [--site SITE_ID]
+                                               [--date-from YYYY-MM-DD] [--date-to YYYY-MM-DD]
+                                               [--top-k N]
 """
 
 import argparse
@@ -42,10 +40,11 @@ def _configure_logging(level: str) -> None:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m netdocs",
-        description="NetDocs ingestion CLI",
+        description="NetDocs CLI",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # --- ingest ---
     ingest = sub.add_parser("ingest", help="Ingest documents into ChromaDB")
     ingest.add_argument(
         "--data-dir",
@@ -68,6 +67,49 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=64,
         help="Embedding batch size (default: 64)",
+    )
+
+    # --- ask ---
+    ask_p = sub.add_parser("ask", help="Ask a question against the document corpus")
+    ask_p.add_argument("question", help="The question to answer")
+    ask_p.add_argument(
+        "--doc-type",
+        dest="doc_type",
+        nargs="+",
+        choices=["design_doc", "runbook", "ticket", "config"],
+        default=None,
+        help="Restrict retrieval to one or more document types",
+    )
+    ask_p.add_argument(
+        "--site",
+        dest="site_id",
+        default=None,
+        help="Restrict retrieval to a specific site ID (e.g. LON-DC01)",
+    )
+    ask_p.add_argument(
+        "--date-from",
+        dest="date_from",
+        default=None,
+        help="Filter tickets by change_date >= YYYY-MM-DD",
+    )
+    ask_p.add_argument(
+        "--date-to",
+        dest="date_to",
+        default=None,
+        help="Filter tickets by change_date <= YYYY-MM-DD",
+    )
+    ask_p.add_argument(
+        "--top-k",
+        dest="top_k",
+        type=int,
+        default=None,
+        help="Number of context chunks to retrieve (default: 5)",
+    )
+    ask_p.add_argument(
+        "--no-rerank",
+        dest="no_rerank",
+        action="store_true",
+        help="Skip cross-encoder reranking (faster but lower quality)",
     )
 
     return parser.parse_args(argv)
@@ -210,11 +252,94 @@ def _print_statistics(chunks) -> None:
     console.print(table)
 
 
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Execute the ask command.
+
+    Returns:
+        Exit code (0 = success, 1 = failure).
+    """
+    _configure_logging(settings.log_level)
+
+    from netdocs.embeddings.embedder import get_embedder
+    from netdocs.retriever.vector_store import VectorStore
+    from netdocs.retriever.bm25_index import BM25Index
+    from netdocs.retriever.hybrid import HybridRetriever
+    from netdocs.retriever.reranker import get_reranker
+    from netdocs.llm.client import get_llm_client
+    from netdocs.llm.generator import generate_answer
+
+    console.rule("[bold cyan]NetDocs Ask")
+    console.print(f"  Question : [bold]{args.question}[/]")
+    console.print(f"  Provider : [green]{settings.llm_provider} / {settings.llm_model}[/]")
+
+    # Build filters
+    filters: dict = {}
+    if args.doc_type:
+        filters["doc_type"] = args.doc_type
+    if args.site_id:
+        filters["site_id"] = args.site_id
+    if args.date_from:
+        filters["date_from"] = args.date_from
+    if args.date_to:
+        filters["date_to"] = args.date_to
+
+    # Initialise pipeline
+    try:
+        t0 = time.perf_counter()
+        embedder = get_embedder()
+        store = VectorStore()
+        bm25 = BM25Index.load_or_build(store)
+        retriever = HybridRetriever(store, bm25, embedder)
+        top_k = args.top_k or settings.retrieval_top_k
+        candidates = retriever.retrieve(
+            args.question,
+            top_k=top_k * 4,
+            candidate_k=settings.retrieval_candidate_k,
+            filters=filters or None,
+        )
+
+        if not args.no_rerank:
+            reranker = get_reranker()
+            top_chunks = reranker.rerank(args.question, candidates, top_k=top_k)
+        else:
+            top_chunks = candidates[:top_k]
+
+        llm = get_llm_client()
+        result = generate_answer(args.question, top_chunks, llm)
+        elapsed = time.perf_counter() - t0
+    except Exception as exc:
+        console.print(f"[red]ERROR:[/] {exc}")
+        logger.exception("ask command failed")
+        return 1
+
+    # --- Output ---
+    console.print()
+    if result.refused:
+        console.print(f"[yellow]⚠ Refused:[/] {result.answer}")
+    else:
+        console.rule("[bold green]Answer")
+        console.print(result.answer)
+        if result.citations:
+            console.print()
+            console.rule("[dim]Sources")
+            for cit in result.citations:
+                console.print(
+                    f"  [cyan]{cit.doc_id}[/]  "
+                    f"[dim]{cit.doc_type}[/]  "
+                    f"§ {cit.section or '—'}  "
+                    f"[dim]{cit.source_file}[/]"
+                )
+    console.print(f"\n[dim]confidence={result.confidence:.4f}  elapsed={elapsed:.1f}s[/]")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     args = _parse_args(argv)
     if args.command == "ingest":
         sys.exit(cmd_ingest(args))
+    elif args.command == "ask":
+        sys.exit(cmd_ask(args))
 
 
 if __name__ == "__main__":

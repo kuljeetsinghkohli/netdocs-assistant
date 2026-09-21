@@ -19,6 +19,8 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         env_prefix="NETDOCS_",
         extra="ignore",
+        # Allow OPENAI_API_KEY alias (no NETDOCS_ prefix)
+        populate_by_name=True,
     )
 
     # --- Embedding backend ------------------------------------------------
@@ -56,6 +58,58 @@ class Settings(BaseSettings):
     chunk_size_runbook: int = Field(default=300)
     chunk_size_ticket: int = Field(default=250)
     chunk_size_config: int = Field(default=600)
+
+    # --- LLM --------------------------------------------------------------
+    llm_provider: str = Field(
+        default="openai",
+        description="LLM provider: 'openai' | 'ollama' | 'fake' (testing only).",
+    )
+    llm_model: str = Field(
+        default="gpt-4o-mini",
+        description="Model name passed to the LLM provider.",
+    )
+    llm_temperature: float = Field(
+        default=0.0,
+        description="Sampling temperature (0 = deterministic).",
+    )
+    llm_max_tokens: int = Field(
+        default=1024,
+        description="Maximum tokens in the LLM completion.",
+    )
+    llm_base_url: str = Field(
+        default="http://localhost:11434/v1",
+        description="Base URL for Ollama / custom OpenAI-compatible endpoint.",
+    )
+    # Read as OPENAI_API_KEY (no NETDOCS_ prefix) via alias
+    openai_api_key: str = Field(
+        default="",
+        alias="OPENAI_API_KEY",
+        description="OpenAI API key (required when llm_provider='openai').",
+    )
+
+    # --- Retrieval --------------------------------------------------------
+    retrieval_top_k: int = Field(
+        default=5,
+        description="Number of final chunks returned to the generator.",
+    )
+    retrieval_candidate_k: int = Field(
+        default=20,
+        description="Candidates fetched before reranking.",
+    )
+    retrieval_confidence_threshold: float = Field(
+        default=0.10,
+        description=(
+            "Minimum reranker score for the top result. "
+            "Answers are refused when all results are below this value."
+        ),
+    )
+    bm25_k1: float = Field(default=1.5)
+    bm25_b: float = Field(default=0.75)
+    rrf_k: int = Field(default=60, description="RRF constant k.")
+
+    # --- API server -------------------------------------------------------
+    api_host: str = Field(default="0.0.0.0")
+    api_port: int = Field(default=8000)
 
     # --- Logging ----------------------------------------------------------
     log_level: str = Field(default="INFO")
