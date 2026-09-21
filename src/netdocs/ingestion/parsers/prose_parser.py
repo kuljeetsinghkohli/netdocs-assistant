@@ -116,7 +116,12 @@ def parse_prose(file_path: Path) -> list[Chunk]:
         for part_idx, chunk_text in enumerate(sub_chunks):
             if not chunk_text.strip():
                 continue
-            combined = f"## {heading_text}\n\n{chunk_text}"
+            # Prefix with doc-type and document title so the embedding encodes
+            # document-type semantics alongside the content.
+            combined = (
+                f"[DOC_TYPE: design_doc] [SOURCE: {doc_title}]\n"
+                f"## {heading_text}\n\n{chunk_text}"
+            )
             chunks.append(
                 Chunk(
                     text=combined,

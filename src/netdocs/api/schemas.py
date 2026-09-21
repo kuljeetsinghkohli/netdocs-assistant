@@ -72,9 +72,16 @@ class CitationOut(BaseModel):
 class AskResponse(BaseModel):
     """Response body for POST /ask."""
 
-    answer: str = Field(description="The generated answer, with inline [doc:...] citations.")
+    answer: str = Field(description="The generated answer, with rendered inline citations.")
     citations: list[CitationOut] = Field(default_factory=list)
     refused: bool = Field(description="True when the system refused to answer.")
+    refusal_reason: str = Field(
+        default="",
+        description=(
+            "Reason for refusal when refused=true. "
+            "One of: 'low_confidence', 'llm_declined', 'empty_generation', or '' when not refused."
+        ),
+    )
     confidence: float = Field(description="Retrieval confidence score of the top result.")
 
 

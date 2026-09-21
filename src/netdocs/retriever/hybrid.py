@@ -4,12 +4,14 @@ from __future__ import annotations
 Hybrid retrieval: dense vector search + BM25, fused via Reciprocal Rank Fusion.
 
 Pipeline:
-    1. Embed the query (via the configured embedder).
-    2. Fetch ``candidate_k`` results from ChromaDB (dense ANN).
-    3. Fetch ``candidate_k`` results from the BM25 index (keyword).
-    4. Fuse rankings with RRF.
-    5. Apply metadata pre-filters to the fused set.
-    6. Return the top ``top_k`` results.
+    1. Expand the query (append procedure-domain keywords when phrasing is
+       procedural — "runbook", "procedure", "how do I", "steps").
+    2. Embed the (expanded) query.
+    3. Fetch ``candidate_k`` results from ChromaDB (dense ANN).
+    4. Fetch ``candidate_k`` results from the BM25 index (keyword).
+    5. Fuse rankings with RRF.
+    6. Apply metadata pre-filters to the fused set.
+    7. Return the top ``top_k`` results.
 
 Metadata filters accepted (all optional, all ANDed together):
     doc_type:   One or more of  "design_doc" | "runbook" | "ticket" | "config"
@@ -19,11 +21,111 @@ Metadata filters accepted (all optional, all ANDed together):
 """
 
 import logging
+import re
 from typing import Any
 
 from netdocs.config import settings
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Query expansion
+# ---------------------------------------------------------------------------
+
+# Phrases that signal "I want a procedure / runbook answer"
+_PROCEDURE_TRIGGERS = re.compile(
+    r"\b(procedure|runbook|steps?|how do i|how to|what (?:is|are) the steps?|"
+    r"what should i do|diagnos|troubleshoot|recover|remediat)\b",
+    re.IGNORECASE,
+)
+
+# Expansion suffix injected for BM25 (dense embedding already covers semantics)
+_PROCEDURE_EXPANSION = "runbook procedure steps diagnosis recovery"
+
+# Ticket-content words that should NOT outrank runbooks for procedural queries
+_TICKET_NOISE_WORDS = re.compile(
+    r"\b(rollback plan|rollback|implementation plan|test plan|outcome|change window)\b",
+    re.IGNORECASE,
+)
+
+
+def _expand_query(query: str) -> str:
+    """Return an expanded query string for BM25 retrieval.
+
+    When the query contains procedure-style phrasing, append runbook-domain
+    keywords.  This raises BM25 scores for runbook chunks that contain "steps",
+    "procedure", etc. without affecting the dense embedding (which is passed
+    the original query).
+
+    Args:
+        query: The raw user query.
+
+    Returns:
+        The query with expansion suffix appended when triggered, otherwise
+        the original query unchanged.
+    """
+    if _PROCEDURE_TRIGGERS.search(query):
+        logger.debug("Query expansion triggered for: %r", query[:80])
+        return f"{query} {_PROCEDURE_EXPANSION}"
+    return query
+
+
+# ---------------------------------------------------------------------------
+# Doc-type relevance boost
+# ---------------------------------------------------------------------------
+
+# Score boosts applied *after* reranking to correct systematic mis-ranking.
+# Values are absolute additions to the cross-encoder rerank_score.
+#   +0.5  runbook/design_doc chunks for procedural queries
+#   −0.5  ticket chunks whose text matches ticket-noise patterns for proc queries
+_RUNBOOK_BOOST = 0.5
+_TICKET_PENALTY = 0.5
+
+
+def apply_doc_type_boost(
+    chunks: list[dict[str, Any]],
+    query: str,
+) -> list[dict[str, Any]]:
+    """Apply doc-type relevance boosts to reranked chunks.
+
+    For procedural queries:
+      * Runbook and design-doc chunks get a +{_RUNBOOK_BOOST} bonus on
+        ``rerank_score`` (or ``rrf_score`` when rerank_score is absent).
+      * Ticket chunks whose text contains ticket-boilerplate patterns
+        (rollback plan, implementation plan, etc.) get a penalty.
+
+    Re-sorts the list by the adjusted score.
+
+    Args:
+        chunks: List of result dicts with ``rerank_score`` or ``rrf_score``.
+        query:  The original user query.
+
+    Returns:
+        Re-sorted list with ``rerank_score`` adjusted in-place.
+    """
+    if not _PROCEDURE_TRIGGERS.search(query):
+        return chunks  # no boost for non-procedural queries
+
+    for chunk in chunks:
+        doc_type = chunk.get("metadata", {}).get("doc_type", "")
+        score_key = "rerank_score" if "rerank_score" in chunk else "rrf_score"
+        current = chunk.get(score_key, 0.0)
+        text = chunk.get("text", "")
+
+        if doc_type == "runbook":
+            chunk[score_key] = current + _RUNBOOK_BOOST
+        elif doc_type == "ticket" and _TICKET_NOISE_WORDS.search(text):
+            chunk[score_key] = current - _TICKET_PENALTY
+
+    # Re-sort by the adjusted score
+    score_key_for_sort = "rerank_score" if any("rerank_score" in c for c in chunks) else "rrf_score"
+    chunks.sort(key=lambda x: x.get(score_key_for_sort, 0.0), reverse=True)
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# RRF
+# ---------------------------------------------------------------------------
 
 
 def _rrf_score(rank: int, k: int) -> float:
@@ -156,7 +258,7 @@ class HybridRetriever:
         k_cand = candidate_k or settings.retrieval_candidate_k
         filt = filters or {}
 
-        # 1. Embed query
+        # 1. Embed the original query (unmodified — dense semantics are good as-is)
         vec = self._embedder.embed([query])[0]
 
         # 2. Dense retrieval (with optional Chroma where-filter)
@@ -167,8 +269,9 @@ class HybridRetriever:
             where=chroma_where,
         )
 
-        # 3. BM25 retrieval (no pre-filter — applied post-fusion)
-        sparse = self._bm25.query(query, n_results=k_cand)
+        # 3. BM25 retrieval — use an expanded query to boost runbook/procedure terms
+        expanded_query = _expand_query(query)
+        sparse = self._bm25.query(expanded_query, n_results=k_cand)
 
         # 4. RRF fusion
         fused = reciprocal_rank_fusion(dense, sparse)
@@ -217,8 +320,9 @@ class HybridRetriever:
                 break
 
         logger.debug(
-            "HybridRetriever: query=%r  dense=%d  sparse=%d  fused=%d  hydrated=%d",
+            "HybridRetriever: query=%r  expanded=%r  dense=%d  sparse=%d  fused=%d  hydrated=%d",
             query[:60],
+            expanded_query[:60] if expanded_query != query else "(unchanged)",
             len(dense),
             len(sparse),
             len(fused),

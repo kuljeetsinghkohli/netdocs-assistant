@@ -129,6 +129,7 @@ def parse_ticket(file_path: Path) -> list[Chunk]:
 
     # Always start with a header summary chunk
     header_summary = (
+        f"[DOC_TYPE: ticket] [SOURCE: {title}]\n"
         f"Ticket: {ticket_id}\nTitle: {title}\n"
         f"Status: {header.get('status', '')}\n"
         f"Risk: {header.get('risk_level', '')}\n"
@@ -150,8 +151,8 @@ def parse_ticket(file_path: Path) -> list[Chunk]:
     for section_name, section_text in sections:
         if not section_text.strip():
             continue
-        # Prepend section label for retrieval context
-        full_text = f"[{section_name.upper().replace('_', ' ')}]\n{section_text}"
+        # Prepend doc-type tag and section label for retrieval context
+        full_text = f"[DOC_TYPE: ticket] [SECTION: {section_name.upper().replace('_', ' ')}]\n{section_text}"
         # If section is large, split it
         words = full_text.split()
         if len(words) <= chunk_size:

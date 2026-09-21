@@ -10,8 +10,13 @@ The generator:
 3. Builds a strict system prompt that forbids hallucination and requires
    ``[doc:<id>:<section>]`` inline citations.
 4. Calls the LLM.
-5. Parses citations from the response and returns a structured
-   :class:`AnswerResponse`.
+5. Parses citations from the response, renders them cleanly, and returns a
+   structured :class:`AnswerResponse`.
+
+Refusal reasons are now distinguished:
+  - ``"low_confidence"`` — retrieval score below threshold (never reached LLM).
+  - ``"llm_declined"``   — LLM returned its own "I cannot find…" sentence.
+  - ``"empty_generation"`` — LLM returned an empty string.
 """
 
 import logging
@@ -31,6 +36,11 @@ LOW_CONFIDENCE_ANSWER = (
     "I cannot find sufficiently relevant information in the available "
     "documentation to answer this question confidently."
 )
+
+# Refusal reason constants
+REFUSAL_LOW_CONFIDENCE = "low_confidence"
+REFUSAL_LLM_DECLINED = "llm_declined"
+REFUSAL_EMPTY_GENERATION = "empty_generation"
 
 
 @dataclass
@@ -55,17 +65,20 @@ class AnswerResponse:
     """Structured answer returned by :func:`generate_answer`.
 
     Attributes:
-        answer:      The assistant's answer text, containing inline citations.
-        citations:   Deduplicated list of :class:`Citation` objects.
-        refused:     ``True`` when the system refused to answer due to low
-                     retrieval confidence.
-        confidence:  The top reranker score (or RRF score) of the best chunk.
-                     ``0.0`` when no chunks were retrieved.
+        answer:         The assistant's answer text with inline citations
+                        rendered as ``[<section> — <doc_id>]``.
+        citations:      Deduplicated list of :class:`Citation` objects.
+        refused:        ``True`` when the system refused to answer.
+        refusal_reason: One of ``"low_confidence"``, ``"llm_declined"``,
+                        ``"empty_generation"``, or ``""`` when not refused.
+        confidence:     The top reranker score (or RRF score) of the best chunk.
+                        ``0.0`` when no chunks were retrieved.
     """
 
     answer: str
     citations: list[Citation] = field(default_factory=list)
     refused: bool = False
+    refusal_reason: str = ""
     confidence: float = 0.0
 
 
@@ -167,6 +180,35 @@ def _parse_citations(
     return citations
 
 
+def render_citations(answer: str, citations: list[Citation]) -> str:
+    """Replace raw ``[doc:<id>:<section>]`` tokens with readable markers.
+
+    Transforms ``text [doc:RB-001__002:Step 1]`` into
+    ``text [Step 1 — RB-001__002]``, eliminating stray `` .`` artefacts
+    that appeared when citations were stripped without substitution.
+
+    Args:
+        answer:    Raw answer text containing ``[doc:...]`` tokens.
+        citations: Parsed citation list (used for section name lookup).
+
+    Returns:
+        Answer with citation tokens replaced by readable ``[section — id]`` markers.
+    """
+    id_to_section: dict[str, str] = {c.doc_id: c.section for c in citations}
+
+    def _replace(m: re.Match) -> str:  # type: ignore[type-arg]
+        raw = m.group(1)
+        parts = raw.split(":", 1)
+        doc_id = parts[0].strip()
+        section = parts[1].strip() if len(parts) > 1 else ""
+        section = section or id_to_section.get(doc_id, "")
+        if section:
+            return f"[{section} — {doc_id}]"
+        return f"[{doc_id}]"
+
+    return _CITATION_RE.sub(_replace, answer)
+
+
 def _top_confidence(chunks: list[dict[str, Any]]) -> float:
     """Return the best confidence score from the chunk list."""
     if not chunks:
@@ -196,6 +238,8 @@ def generate_answer(
 
     Returns:
         An :class:`AnswerResponse` with the answer, citations, and metadata.
+        The ``refusal_reason`` field is set to one of:
+          ``"low_confidence"`` / ``"llm_declined"`` / ``"empty_generation"`` / ``""``.
     """
     threshold = (
         confidence_threshold
@@ -204,10 +248,10 @@ def generate_answer(
     )
     confidence = _top_confidence(chunks)
 
-    # --- Low-confidence refusal ---
+    # --- Low-confidence refusal (never reaches LLM) ---
     if not chunks or confidence < threshold:
         logger.info(
-            "Refusing to answer: confidence=%.4f < threshold=%.4f  query=%r",
+            "Refusing to answer [low_confidence]: confidence=%.4f < threshold=%.4f  query=%r",
             confidence,
             threshold,
             query[:80],
@@ -215,6 +259,7 @@ def generate_answer(
         return AnswerResponse(
             answer=LOW_CONFIDENCE_ANSWER,
             refused=True,
+            refusal_reason=REFUSAL_LOW_CONFIDENCE,
             confidence=confidence,
         )
 
@@ -230,14 +275,39 @@ def generate_answer(
 
     raw_answer = llm_client.complete(system=system, user=query)
 
-    # Check if the LLM returned its own refusal (matches our sentinel)
-    refused = LOW_CONFIDENCE_ANSWER.lower() in raw_answer.lower()
+    # --- Empty generation refusal ---
+    if not raw_answer.strip():
+        logger.warning(
+            "Refusing to answer [empty_generation]: LLM returned empty string  query=%r",
+            query[:80],
+        )
+        return AnswerResponse(
+            answer=LOW_CONFIDENCE_ANSWER,
+            refused=True,
+            refusal_reason=REFUSAL_EMPTY_GENERATION,
+            confidence=confidence,
+        )
 
-    citations = [] if refused else _parse_citations(raw_answer, chunks)
+    # --- LLM declined ---
+    if LOW_CONFIDENCE_ANSWER.lower() in raw_answer.lower():
+        logger.info(
+            "Refusing to answer [llm_declined]: LLM returned its own refusal  query=%r",
+            query[:80],
+        )
+        return AnswerResponse(
+            answer=raw_answer.strip(),
+            refused=True,
+            refusal_reason=REFUSAL_LLM_DECLINED,
+            confidence=confidence,
+        )
+
+    citations = _parse_citations(raw_answer, chunks)
+    rendered = render_citations(raw_answer, citations)
 
     return AnswerResponse(
-        answer=raw_answer.strip(),
+        answer=rendered.strip(),
         citations=citations,
-        refused=refused,
+        refused=False,
+        refusal_reason="",
         confidence=confidence,
     )

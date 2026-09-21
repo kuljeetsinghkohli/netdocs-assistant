@@ -126,7 +126,14 @@ def parse_runbook(file_path: Path) -> list[Chunk]:
         for part_idx, chunk_text in enumerate(sub_chunks):
             if not chunk_text.strip():
                 continue
-            combined = f"### {heading_text}\n\n{chunk_text}"
+            # Prefix with doc-type and source title so the embedding model
+            # encodes document-type semantics alongside the content.  This
+            # makes phrasing like "runbook procedure" rank runbook chunks
+            # higher even when the body text does not repeat those words.
+            combined = (
+                f"[DOC_TYPE: runbook] [SOURCE: {doc_title}]\n"
+                f"### {heading_text}\n\n{chunk_text}"
+            )
             chunks.append(
                 Chunk(
                     text=combined,

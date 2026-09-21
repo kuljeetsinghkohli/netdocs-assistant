@@ -125,6 +125,10 @@ async def ask(request: AskRequest) -> AskResponse:
         top_k=request.top_k or settings.retrieval_top_k,
     )
 
+    # Apply doc-type boost to correct systematic mis-ordering for procedural queries
+    from netdocs.retriever.hybrid import apply_doc_type_boost
+    top_chunks = apply_doc_type_boost(top_chunks, request.question)
+
     # Generate
     result = generate_answer(request.question, top_chunks, llm)
 
@@ -140,5 +144,6 @@ async def ask(request: AskRequest) -> AskResponse:
             for c in result.citations
         ],
         refused=result.refused,
+        refusal_reason=result.refusal_reason,
         confidence=result.confidence,
     )

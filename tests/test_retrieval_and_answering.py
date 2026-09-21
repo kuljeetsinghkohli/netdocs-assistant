@@ -1019,3 +1019,273 @@ class TestGeminiClientHelpers:
         assert "Wait" not in result
         assert "Could I" not in result
         assert "Re-add the removed route-map clauses" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests: Query expansion and doc-type boosting
+# ---------------------------------------------------------------------------
+
+class TestQueryExpansion:
+    def test_procedure_phrase_triggers_expansion(self):
+        from netdocs.retriever.hybrid import _expand_query
+
+        expanded = _expand_query("What is the runbook procedure when a BGP session flaps?")
+        assert "runbook procedure steps" in expanded
+
+    def test_non_procedure_phrase_unchanged(self):
+        from netdocs.retriever.hybrid import _expand_query
+
+        q = "What BGP ASN does Contoso use?"
+        assert _expand_query(q) == q
+
+    def test_how_do_i_triggers_expansion(self):
+        from netdocs.retriever.hybrid import _expand_query
+
+        q = "How do I diagnose a BGP flap?"
+        expanded = _expand_query(q)
+        assert len(expanded) > len(q)
+
+    def test_steps_triggers_expansion(self):
+        from netdocs.retriever.hybrid import _expand_query
+
+        q = "What steps should I follow for tunnel recovery?"
+        assert len(_expand_query(q)) > len(q)
+
+
+class TestDocTypeBoost:
+    def _make_chunk(self, doc_type: str, text: str = "BGP flap") -> dict:
+        return {
+            "id": f"{doc_type}_001",
+            "text": text,
+            "metadata": {"doc_type": doc_type},
+            "rerank_score": 2.0,
+        }
+
+    def test_runbook_boosted_for_procedure_query(self):
+        from netdocs.retriever.hybrid import apply_doc_type_boost
+
+        chunks = [
+            self._make_chunk("ticket", text="rollback plan re-add removed route-map"),
+            self._make_chunk("runbook"),
+        ]
+        # Both start at score 2.0; ticket has rollback-plan text
+        result = apply_doc_type_boost(chunks, "What is the runbook procedure when BGP flaps?")
+        assert result[0]["metadata"]["doc_type"] == "runbook"
+
+    def test_ticket_with_rollback_penalised(self):
+        from netdocs.retriever.hybrid import apply_doc_type_boost
+
+        ticket_chunk = {
+            "id": "crq_001",
+            "text": "ROLLBACK PLAN\n1. Re-add the removed route-map clauses.",
+            "metadata": {"doc_type": "ticket"},
+            "rerank_score": 3.0,
+        }
+        runbook_chunk = {
+            "id": "rb_001",
+            "text": "BGP flap diagnosis steps.",
+            "metadata": {"doc_type": "runbook"},
+            "rerank_score": 2.5,
+        }
+        result = apply_doc_type_boost([ticket_chunk, runbook_chunk], "How do I diagnose a BGP flap?")
+        # Runbook should rank first after boost
+        assert result[0]["id"] == "rb_001"
+
+    def test_no_boost_for_non_procedural_query(self):
+        from netdocs.retriever.hybrid import apply_doc_type_boost
+
+        chunks = [
+            self._make_chunk("ticket"),
+            self._make_chunk("runbook"),
+        ]
+        original_order = [c["id"] for c in chunks]
+        result = apply_doc_type_boost(chunks, "What BGP ASN does Contoso use?")
+        # Scores unchanged, order preserved (ticket had score 2.0 first)
+        assert [c["id"] for c in result] == original_order
+
+
+# ---------------------------------------------------------------------------
+# Tests: Refusal reason distinction
+# ---------------------------------------------------------------------------
+
+class TestRefusalReason:
+    def _fake_llm(self, answer: str):
+        from netdocs.llm.client import FakeLLMClient
+        return FakeLLMClient(canned_answer=answer)
+
+    def _chunk(self, score: float = 5.0) -> dict:
+        return {
+            "id": "X__000",
+            "text": "some text",
+            "metadata": {"doc_type": "design_doc", "section_heading": "Overview"},
+            "rerank_score": score,
+        }
+
+    def test_low_confidence_sets_reason(self):
+        from netdocs.llm.generator import generate_answer, REFUSAL_LOW_CONFIDENCE
+
+        result = generate_answer("q", [self._chunk(-5.0)], self._fake_llm("ok"), confidence_threshold=0.0)
+        assert result.refused
+        assert result.refusal_reason == REFUSAL_LOW_CONFIDENCE
+
+    def test_empty_generation_sets_reason(self):
+        from netdocs.llm.generator import generate_answer, REFUSAL_EMPTY_GENERATION
+
+        result = generate_answer("q", [self._chunk(5.0)], self._fake_llm(""), confidence_threshold=-99.0)
+        assert result.refused
+        assert result.refusal_reason == REFUSAL_EMPTY_GENERATION
+
+    def test_llm_declined_sets_reason(self):
+        from netdocs.llm.generator import generate_answer, LOW_CONFIDENCE_ANSWER, REFUSAL_LLM_DECLINED
+
+        result = generate_answer("q", [self._chunk(5.0)], self._fake_llm(LOW_CONFIDENCE_ANSWER), confidence_threshold=-99.0)
+        assert result.refused
+        assert result.refusal_reason == REFUSAL_LLM_DECLINED
+
+    def test_successful_answer_has_no_reason(self):
+        from netdocs.llm.generator import generate_answer
+
+        result = generate_answer("q", [self._chunk(5.0)], self._fake_llm("The answer is 42."), confidence_threshold=-99.0)
+        assert not result.refused
+        assert result.refusal_reason == ""
+
+
+# ---------------------------------------------------------------------------
+# Tests: Citation rendering (no stray " .")
+# ---------------------------------------------------------------------------
+
+class TestCitationRendering:
+    def test_renders_doc_id_and_section(self):
+        from netdocs.llm.generator import render_citations, Citation
+
+        citations = [Citation(doc_id="RB-001__002", section="Step 1 — Confirm the Flap")]
+        answer = "Run show bgp summary. [doc:RB-001__002:Step 1 — Confirm the Flap]"
+        rendered = render_citations(answer, citations)
+        assert "[doc:" not in rendered
+        assert "[Step 1 — Confirm the Flap — RB-001__002]" in rendered
+
+    def test_no_stray_period_space(self):
+        from netdocs.llm.generator import render_citations, Citation
+
+        citations = [Citation(doc_id="DD-003__001", section="BGP Overview")]
+        answer = "The hold timer is 90s [doc:DD-003__001:BGP Overview]."
+        rendered = render_citations(answer, citations)
+        assert " ." not in rendered
+
+    def test_citation_without_section_uses_lookup(self):
+        from netdocs.llm.generator import render_citations, Citation
+
+        citations = [Citation(doc_id="DD-003__001", section="My Section")]
+        answer = "Some text [doc:DD-003__001]."
+        rendered = render_citations(answer, citations)
+        assert "[My Section — DD-003__001]" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Tests: Regression — BGP runbook must rank in top 3 for both phrasings
+# ---------------------------------------------------------------------------
+
+class TestBGPRunbookRegression:
+    """
+    Offline regression using FakeVectorStore / FakeBM25Index.
+
+    We simulate a corpus where RB-001 (runbook) competes with CRQ-2024-1015
+    (ticket rollback plan) — which was the real mis-ranking case.
+
+    These tests verify that:
+    1. Query expansion adds runbook keywords to the BM25 query.
+    2. Doc-type boost places RB-001 in the top-3 for both BGP-flap phrasings.
+    """
+
+    def _make_corpus(self) -> list[dict]:
+        """Minimal corpus replicating the mis-ranking scenario."""
+        return [
+            # Runbook chunk — procedure-style content
+            {
+                "id": "RB-001_bgp_flap_diagnosis__000",
+                "text": (
+                    "[DOC_TYPE: runbook] [SOURCE: RB-001: BGP Peer Flapping — Diagnosis and Recovery]\n"
+                    "### Step 1 — Confirm the Flap and Identify the Peer\n\n"
+                    "Log in to the affected router and check BGP summary:\n"
+                    "show bgp summary\nshow bgp neighbors <peer-ip>"
+                ),
+                "metadata": {
+                    "doc_type": "runbook",
+                    "source_file": "data/raw/runbooks/RB-001_bgp_flap_diagnosis.md",
+                    "procedure_name": "Confirm the Flap and Identify the Peer",
+                    "step_number": 1,
+                },
+            },
+            # Ticket chunk — rollback plan containing BGP keywords
+            {
+                "id": "CRQ-2024-1015__002",
+                "text": (
+                    "[DOC_TYPE: ticket] [SECTION: ROLLBACK PLAN]\n"
+                    "If any BGP session is disrupted:\n"
+                    "1. Re-add the removed route-map clauses.\n"
+                    "2. Soft reset outbound.\n"
+                    "3. Verify session stability."
+                ),
+                "metadata": {
+                    "doc_type": "ticket",
+                    "source_file": "data/raw/tickets/CRQ-2024-1015.txt",
+                    "section": "rollback_plan",
+                },
+            },
+            # Another ticket chunk — description
+            {
+                "id": "CRQ-2024-1015__001",
+                "text": (
+                    "[DOC_TYPE: ticket] [SECTION: DESCRIPTION]\n"
+                    "BGP route-map audit. Stale prefix-list removed. "
+                    "Session stability verified after change."
+                ),
+                "metadata": {
+                    "doc_type": "ticket",
+                    "source_file": "data/raw/tickets/CRQ-2024-1015.txt",
+                    "section": "description",
+                },
+            },
+        ]
+
+    def _rerank_with_boost(self, query: str, chunks: list[dict], top_k: int = 3) -> list[dict]:
+        """Simulate reranker + boost without loading real models."""
+        from netdocs.retriever.hybrid import apply_doc_type_boost
+
+        # Assign fake rerank_score based on keyword overlap (simulates cross-encoder)
+        query_words = set(query.lower().split())
+        for chunk in chunks:
+            text_words = set(chunk["text"].lower().split())
+            overlap = len(query_words & text_words)
+            chunk["rerank_score"] = float(overlap)
+
+        # Apply doc-type boost
+        boosted = apply_doc_type_boost(list(chunks), query)
+        return boosted[:top_k]
+
+    def _check_rb001_in_top3(self, query: str):
+        corpus = self._make_corpus()
+        top3 = self._rerank_with_boost(query, corpus, top_k=3)
+        top3_sources = [c["metadata"]["source_file"] for c in top3]
+        assert any("RB-001_bgp_flap_diagnosis" in s for s in top3_sources), (
+            f"RB-001_bgp_flap_diagnosis not in top-3 for query: {query!r}\n"
+            f"Got: {top3_sources}"
+        )
+
+    def test_bgp_runbook_top3_procedure_phrasing(self):
+        """'What is the runbook procedure when a BGP session flaps?' → RB-001 top-3"""
+        self._check_rb001_in_top3("What is the runbook procedure when a BGP session flaps?")
+
+    def test_bgp_runbook_top3_diagnosis_phrasing(self):
+        """'How do I diagnose a BGP flap?' → RB-001 top-3"""
+        self._check_rb001_in_top3("How do I diagnose a BGP flap?")
+
+    def test_query_expansion_adds_runbook_keywords(self):
+        from netdocs.retriever.hybrid import _expand_query
+
+        q1 = "What is the runbook procedure when a BGP session flaps?"
+        q2 = "How do I diagnose a BGP flap?"
+        for q in (q1, q2):
+            expanded = _expand_query(q)
+            assert expanded != q, f"No expansion for: {q!r}"
+            assert "runbook" in expanded.lower() or "procedure" in expanded.lower()

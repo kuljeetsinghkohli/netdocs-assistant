@@ -9,6 +9,7 @@ Sub-commands::
     python -m netdocs ask "your question here" [--doc-type TYPE] [--site SITE_ID]
                                                [--date-from YYYY-MM-DD] [--date-to YYYY-MM-DD]
                                                [--top-k N]
+    python -m netdocs eval [--top-k N] [--out PATH] [--threshold FLOAT]
 """
 
 import argparse
@@ -136,6 +137,36 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="no_rerank",
         action="store_true",
         help="Skip cross-encoder reranking (faster but lower quality)",
+    )
+
+    # --- eval ---
+    eval_p = sub.add_parser(
+        "eval",
+        help="Run retrieval-only evaluation on the golden Q&A set (no LLM calls)",
+    )
+    eval_p.add_argument(
+        "--top-k",
+        dest="top_k",
+        type=int,
+        default=5,
+        help="Number of chunks to retrieve per question (default: 5)",
+    )
+    eval_p.add_argument(
+        "--threshold",
+        dest="threshold",
+        type=float,
+        default=None,
+        help=(
+            "Confidence threshold for refusal accuracy (default: "
+            "settings.retrieval_confidence_threshold)"
+        ),
+    )
+    eval_p.add_argument(
+        "--out",
+        dest="out",
+        type=Path,
+        default=None,
+        help="Path for the Markdown report (default: reports/eval_report.md)",
     )
 
     return parser.parse_args(argv)
@@ -278,6 +309,23 @@ def _print_statistics(chunks) -> None:
     console.print(table)
 
 
+def _get_active_model_name() -> str:
+    """Return the real model name for the active provider.
+
+    Resolves which provider is actually being used (accounting for auto-fallback)
+    and returns the concrete model string, not the static ``settings.llm_model``
+    which may still read "gpt-4o-mini" when the provider fell back to Gemini.
+    """
+    from netdocs.llm.client import _resolve_provider
+
+    provider = _resolve_provider()
+    if provider == "gemini":
+        return settings.gemini_model or settings.llm_model
+    if provider in ("openai", "ollama"):
+        return settings.llm_model
+    return provider  # "extractive" / "fake" — just show the provider name
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     """Execute the ask command.
 
@@ -291,15 +339,14 @@ def cmd_ask(args: argparse.Namespace) -> int:
     from netdocs.retriever.bm25_index import BM25Index
     from netdocs.retriever.hybrid import HybridRetriever
     from netdocs.retriever.reranker import get_reranker
-    from netdocs.llm.client import get_llm_client
-    from netdocs.llm.generator import generate_answer
-
-    from netdocs.llm.client import _resolve_provider
+    from netdocs.llm.client import get_llm_client, _resolve_provider
+    from netdocs.llm.generator import generate_answer, REFUSAL_LOW_CONFIDENCE, REFUSAL_LLM_DECLINED, REFUSAL_EMPTY_GENERATION
 
     console.rule("[bold cyan]NetDocs Ask")
     console.print(f"  Question : [bold]{args.question}[/]")
     effective_provider = _resolve_provider()
-    console.print(f"  Provider : [green]{effective_provider} / {settings.llm_model}[/]")
+    active_model = _get_active_model_name()
+    console.print(f"  Provider : [green]{effective_provider} / {active_model}[/]")
 
     # Build filters
     filters: dict = {}
@@ -330,6 +377,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
         if not args.no_rerank:
             reranker = get_reranker()
             top_chunks = reranker.rerank(args.question, candidates, top_k=top_k)
+            # Apply doc-type boost after reranking to correct systematic mis-ordering
+            from netdocs.retriever.hybrid import apply_doc_type_boost
+            top_chunks = apply_doc_type_boost(top_chunks, args.question)
         else:
             top_chunks = candidates[:top_k]
 
@@ -344,7 +394,17 @@ def cmd_ask(args: argparse.Namespace) -> int:
     # --- Output ---
     console.print()
     if result.refused:
-        console.print(f"[yellow]⚠ Refused:[/] {result.answer}")
+        reason_labels = {
+            REFUSAL_LOW_CONFIDENCE: "Low retrieval confidence — no sufficiently relevant chunks found",
+            REFUSAL_LLM_DECLINED: "LLM declined to answer — context passages did not contain enough information",
+            REFUSAL_EMPTY_GENERATION: "Empty generation — LLM returned no text",
+        }
+        reason_label = reason_labels.get(
+            result.refusal_reason,
+            f"Refused ({result.refusal_reason or 'unknown reason'})",
+        )
+        console.print(f"[yellow]⚠ {reason_label}[/]")
+        console.print(f"  {result.answer}")
     else:
         console.rule("[bold green]Answer")
         console.print(result.answer)
@@ -362,6 +422,86 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Execute the eval command — retrieval-only, no LLM calls.
+
+    Returns:
+        Exit code (0 = all answerable passed, 1 = some failed).
+    """
+    _configure_logging(settings.log_level)
+
+    from netdocs.eval.harness import run_eval
+    from netdocs.eval.reporter import write_report
+
+    console.rule("[bold cyan]NetDocs Retrieval Evaluation")
+    console.print(f"  Top-K     : [green]{args.top_k}[/]")
+    if args.threshold is not None:
+        console.print(f"  Threshold : [green]{args.threshold}[/]")
+    console.print()
+
+    t0 = time.perf_counter()
+    try:
+        report = run_eval(
+            top_k=args.top_k,
+            confidence_threshold=args.threshold,
+        )
+    except Exception as exc:
+        console.print(f"[red]ERROR:[/] {exc}")
+        logger.exception("eval command failed")
+        return 1
+
+    elapsed = time.perf_counter() - t0
+
+    # Print summary
+    console.rule("[bold green]Eval Results")
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Answerable questions", str(report.n_answerable))
+    table.add_row("Unanswerable questions", str(report.n_unanswerable))
+    table.add_row("Hit@1", f"{report.hit_at_1:.1%}")
+    table.add_row("Hit@3", f"{report.hit_at_3:.1%}")
+    table.add_row("Hit@5", f"{report.hit_at_5:.1%}")
+    table.add_row("MRR", f"{report.mrr:.4f}")
+    table.add_row("Refusal accuracy", f"{report.refusal_accuracy:.1%}")
+    console.print(table)
+
+    # Per-question failures
+    failures = [
+        r for r in report.results
+        if (not r.unanswerable and not (r.rank and r.rank <= report.top_k))
+        or (r.unanswerable and not r.refusal_correct)
+    ]
+    if failures:
+        console.print(f"\n[yellow]Failures ({len(failures)}):[/]")
+        for r in failures:
+            if r.unanswerable:
+                top_score = r.retrieved_scores[0] if r.retrieved_scores else 0.0
+                console.print(
+                    f"  [red]{r.qid}[/] (unanswerable not refused): "
+                    f"top_score={top_score:.3f}  {r.question[:60]}"
+                )
+            else:
+                console.print(
+                    f"  [red]{r.qid}[/] (miss rank={r.rank}): "
+                    f"expected={r.expected_sources}  {r.question[:60]}"
+                )
+    else:
+        console.print("\n[bold green]All questions passed![/]")
+
+    # Write report
+    out_path = write_report(report, args.out)
+    console.print(f"\n[dim]Report written to: {out_path}[/]")
+    console.print(f"[dim]Total eval time: {elapsed:.1f}s[/]")
+
+    # Exit 1 if any answerable question is a miss (regression guard)
+    has_misses = any(
+        not r.unanswerable and not (r.rank and r.rank <= report.top_k)
+        for r in report.results
+    )
+    return 1 if has_misses else 0
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     args = _parse_args(argv)
@@ -369,6 +509,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(cmd_ingest(args))
     elif args.command == "ask":
         sys.exit(cmd_ask(args))
+    elif args.command == "eval":
+        sys.exit(cmd_eval(args))
 
 
 if __name__ == "__main__":
