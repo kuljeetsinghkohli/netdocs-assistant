@@ -188,7 +188,7 @@ These numbers were measured after iterative tuning — chunk prefixing, doc-type
 
 ### Test suite
 
-167 tests pass (`pytest -q`), covering retrieval correctness, gemini fallback chain logic, refusal behaviour, agent tool dispatch, and API endpoint smoke tests.
+180 tests pass (`pytest -q`), covering retrieval correctness, gemini fallback chain logic, refusal behaviour, agent tool dispatch, and API endpoint smoke tests.
 
 ---
 
@@ -198,7 +198,7 @@ These numbers were measured after iterative tuning — chunk prefixing, doc-type
 
 **Fallback chain for real free-tier failures.** Running this project on the Gemini free tier surfaced three distinct failure modes: daily-quota `429` errors, retired-model `404` errors (models removed without notice for new users), and `INVALID_ARGUMENT 400` errors caused by unsupported `thinking_config` fields on some model versions. The `GEMINI_MODEL_FALLBACKS` chain handles all three: the client tries each model in order, remembers failed models for the process lifetime, and finally degrades to extractive mode rather than returning a 500. These were not hypothetical failure modes — they are what actually happened during development.
 
-**Degraded extractive mode.** When all LLM models fail, the system returns the top retrieved passage directly as the answer with a `[DEGRADED]` prefix. This preserves some utility and is clearly flagged in the API response and the UI banner. An all-models-failed graceful-error path (returning a clean error response rather than degraded content) is on the roadmap.
+**Degraded extractive mode.** When all LLM models fail, the system returns the top retrieved passage directly as the answer with a `[DEGRADED]` prefix. This preserves some utility and is clearly flagged in the API response and the UI banner.
 
 **Agent tool guardrails.** The agent loop has four explicit guards: a max-steps ceiling (default 8) to prevent runaway LLM iteration, duplicate-call detection that breaks the loop when the same `(tool, args)` pair repeats, per-tool timeouts via `concurrent.futures`, and a human-approval gate for `draft_change_plan` (the only state-mutating tool). The loop uses plain Python — no LangGraph, no LangChain — so the control flow is readable and debuggable without a framework-specific mental model.
 
@@ -250,10 +250,8 @@ IBM Bob's Agent mode was the primary development environment throughout this pro
 
 ## 9. Roadmap
 
-1. **Numbered inline citations.** Replace `[Source: filename, section]` markers with numbered footnotes (`[1]`, `[2]`) and a rendered reference list at the end of each answer.
-2. **Neighbouring-chunk context.** When a retrieved chunk is from the middle of a config block or runbook procedure, fetch the preceding and following chunks to give the LLM fuller context.
-3. **All-models-failed graceful handling.** Return a clean error response (HTTP 503 with a structured JSON body) when the entire fallback chain is exhausted, rather than silently degrading to extractive mode.
-4. **Docker and CI.** A `Dockerfile` for the API and a GitHub Actions workflow running `pytest` and `make eval` (retrieval metrics only, no LLM calls) on every push to `main`.
+1. **Neighbouring-chunk context.** When a retrieved chunk is from the middle of a config block or runbook procedure, fetch the preceding and following chunks to give the LLM fuller context.
+2. **Docker and CI.** A `Dockerfile` for the API and a GitHub Actions workflow running `pytest` and `make eval` (retrieval metrics only, no LLM calls) on every push to `main`.
 
 ---
 
