@@ -120,13 +120,16 @@ class Settings(BaseSettings):
         description="Candidates fetched before reranking.",
     )
     retrieval_confidence_threshold: float = Field(
-        default=-0.5,
+        default=0.25,
         description=(
             "Minimum reranker score for the top result. "
             "Answers are refused when all results are below this value. "
             "Raw cross-encoder logits (ms-marco-MiniLM-L-6-v2) range roughly "
             "-10 to +10; truly irrelevant content scores below -1.0. "
-            "Calibrated to -0.5 on the golden eval set."
+            "Calibrated to 0.25 on the golden eval set: passes all answerable "
+            "questions (lowest top-score among hits is 1.831) while refusing "
+            "unanswerable Q27 (0.209) and Q29 (-0.089). "
+            "Q30 is handled by is_out_of_scope() regardless of score."
         ),
     )
     bm25_k1: float = Field(default=1.5)

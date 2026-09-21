@@ -241,12 +241,27 @@ def generate_answer(
         The ``refusal_reason`` field is set to one of:
           ``"low_confidence"`` / ``"llm_declined"`` / ``"empty_generation"`` / ``""``.
     """
+    from netdocs.retriever.hybrid import is_out_of_scope
+
     threshold = (
         confidence_threshold
         if confidence_threshold is not None
         else settings.retrieval_confidence_threshold
     )
     confidence = _top_confidence(chunks)
+
+    # --- Out-of-scope topic refusal (never reaches LLM) ---
+    if is_out_of_scope(query):
+        logger.info(
+            "Refusing to answer [low_confidence/ood]: query matches out-of-scope topic  query=%r",
+            query[:80],
+        )
+        return AnswerResponse(
+            answer=LOW_CONFIDENCE_ANSWER,
+            refused=True,
+            refusal_reason=REFUSAL_LOW_CONFIDENCE,
+            confidence=confidence,
+        )
 
     # --- Low-confidence refusal (never reaches LLM) ---
     if not chunks or confidence < threshold:

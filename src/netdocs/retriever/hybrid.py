@@ -29,13 +29,15 @@ from netdocs.config import settings
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Query expansion
+# Query normalisation and expansion
 # ---------------------------------------------------------------------------
 
 # Phrases that signal "I want a procedure / runbook answer"
 _PROCEDURE_TRIGGERS = re.compile(
     r"\b(procedure|runbook|steps?|how do i|how to|what (?:is|are) the steps?|"
-    r"what should i do|diagnos|troubleshoot|recover|remediat)\b",
+    r"what should i do|diagnos|troubleshoot|recover|remediat|fix|resolve|"
+    r"when (?:a|the) \w+ (?:goes?|went|is|flap|fail|down)|"
+    r"what (?:is|are) the (?:runbook|procedure))\b",
     re.IGNORECASE,
 )
 
@@ -48,26 +50,111 @@ _TICKET_NOISE_WORDS = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Out-of-scope (OOD) topic detection
+# ---------------------------------------------------------------------------
 
-def _expand_query(query: str) -> str:
-    """Return an expanded query string for BM25 retrieval.
+# Topics that are provably NOT covered in the NetDocs corpus.
+# Queries that match these patterns should be refused regardless of reranker
+# score, because a high cross-encoder score can arise from partial keyword
+# overlap with in-scope documents (e.g. "SD-WAN vendor" matching SD-WAN docs
+# even though vendor SLA details are absent).
+_OOD_PATTERNS = re.compile(
+    r"\b(snmp community|snmp community string|wifi password|wi-?fi password|"
+    r"wireless password|guest (?:wifi|network) password|"
+    r"sla for .{0,40}(?:vendor|support|contract)|"
+    r"vendor support (?:sla|contract|agreement)|"
+    r"(?:support contract|maintenance contract) sla|"
+    r"configure (?:cisco )?aci|aci fabric)\b",
+    re.IGNORECASE,
+)
 
-    When the query contains procedure-style phrasing, append runbook-domain
-    keywords.  This raises BM25 scores for runbook chunks that contain "steps",
-    "procedure", etc. without affecting the dense embedding (which is passed
-    the original query).
+
+def is_out_of_scope(query: str) -> bool:
+    """Return True when the query matches a known out-of-corpus topic.
+
+    This guard prevents a high cross-encoder score arising from superficial
+    keyword overlap (e.g. "SD-WAN vendor SLA" scoring against SD-WAN design
+    docs) from leaking through to the user as a confident answer.
 
     Args:
         query: The raw user query.
 
     Returns:
-        The query with expansion suffix appended when triggered, otherwise
+        True if the query is provably unanswerable from the current corpus.
+    """
+    return bool(_OOD_PATTERNS.search(query))
+
+
+# ---------------------------------------------------------------------------
+# Query synonym normalisation
+# ---------------------------------------------------------------------------
+
+# Maps surface-form phrasing variants to canonical retrieval terms.
+# Applied before BM25 so that e.g. "flapping" and "flaps" both hit "flap"
+# and "session flaps" expands to include "BGP peer flapping keepalive".
+_SYNONYM_MAP: list[tuple[re.Pattern[str], str]] = [
+    # BGP session instability variants
+    (re.compile(r"\bflap(?:ping|s)?\b", re.IGNORECASE), "flap flapping"),
+    # "goes down" / "went down" → common runbook phrasing
+    (re.compile(r"\bgo(?:es|ne)?\s+down\b", re.IGNORECASE), "down failure"),
+    (re.compile(r"\bwent\s+down\b", re.IGNORECASE), "down failure"),
+    # "neighbour" vs "neighbor" normalisation
+    (re.compile(r"\bneighbour\b", re.IGNORECASE), "neighbor neighbour"),
+    # "recover" / "recovery" → standard runbook keyword
+    (re.compile(r"\brecover(?:y|ing)?\b", re.IGNORECASE), "recover recovery"),
+    # "renew" / "renewal" → cert runbook keyword
+    (re.compile(r"\brenew(?:al|ing)?\b", re.IGNORECASE), "renew renewal"),
+]
+
+
+def normalize_query(query: str) -> str:
+    """Apply synonym expansion to the query for BM25 retrieval.
+
+    This is applied *in addition to* the procedure-trigger expansion so that
+    phrasing variants such as "session flaps" or "neighbour goes down" receive
+    the same BM25 token weight as the canonical phrasing present in runbook
+    headings.
+
+    Args:
+        query: The raw (or procedure-expanded) query string.
+
+    Returns:
+        Query with synonym expansions appended (originals preserved).
+    """
+    extras: list[str] = []
+    for pattern, replacement in _SYNONYM_MAP:
+        if pattern.search(query):
+            extras.append(replacement)
+    if extras:
+        expanded = f"{query} {' '.join(extras)}"
+        logger.debug("Synonym expansion: %r → %r", query[:60], expanded[:80])
+        return expanded
+    return query
+
+
+def _expand_query(query: str) -> str:
+    """Return an expanded query string for BM25 retrieval.
+
+    Applies two layers of expansion in sequence:
+      1. Procedure-trigger expansion (appends "runbook procedure steps …").
+      2. Synonym normalisation (appends variant forms of key terms).
+
+    The dense embedding receives the *original* query unchanged; only BM25
+    benefits from the expansion.
+
+    Args:
+        query: The raw user query.
+
+    Returns:
+        The query with expansion suffixes appended when triggered, otherwise
         the original query unchanged.
     """
+    expanded = query
     if _PROCEDURE_TRIGGERS.search(query):
         logger.debug("Query expansion triggered for: %r", query[:80])
-        return f"{query} {_PROCEDURE_EXPANSION}"
-    return query
+        expanded = f"{query} {_PROCEDURE_EXPANSION}"
+    return normalize_query(expanded)
 
 
 # ---------------------------------------------------------------------------

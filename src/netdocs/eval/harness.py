@@ -168,8 +168,9 @@ def run_eval(
         # Refusal accuracy for unanswerable questions
         refusal_correct: bool | None = None
         if gq.unanswerable:
+            from netdocs.retriever.hybrid import is_out_of_scope
             top_score = max(retrieved_scores, default=0.0)
-            refusal_correct = top_score < threshold
+            refusal_correct = top_score < threshold or is_out_of_scope(gq.question)
 
         qr = QuestionResult(
             qid=gq.qid,

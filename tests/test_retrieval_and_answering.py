@@ -1051,6 +1051,102 @@ class TestQueryExpansion:
         q = "What steps should I follow for tunnel recovery?"
         assert len(_expand_query(q)) > len(q)
 
+    def test_fix_triggers_expansion(self):
+        from netdocs.retriever.hybrid import _expand_query
+
+        q = "How do I fix a BGP session that keeps dropping?"
+        expanded = _expand_query(q)
+        assert len(expanded) > len(q)
+
+    def test_when_a_session_flaps_triggers_expansion(self):
+        from netdocs.retriever.hybrid import _expand_query
+
+        q = "What is the runbook procedure when a BGP session flaps?"
+        expanded = _expand_query(q)
+        assert "runbook" in expanded.lower()
+
+    def test_synonym_flapping_expanded(self):
+        from netdocs.retriever.hybrid import normalize_query
+
+        q = "BGP session is flapping"
+        expanded = normalize_query(q)
+        assert "flap" in expanded
+
+    def test_synonym_neighbour_expanded(self):
+        from netdocs.retriever.hybrid import normalize_query
+
+        q = "BGP neighbour went down"
+        expanded = normalize_query(q)
+        assert "neighbor" in expanded
+
+    def test_synonym_went_down_expanded(self):
+        from netdocs.retriever.hybrid import normalize_query
+
+        q = "The tunnel went down between vEdge sites"
+        expanded = normalize_query(q)
+        assert "failure" in expanded
+
+    def test_synonym_renewal_expanded(self):
+        from netdocs.retriever.hybrid import normalize_query
+
+        q = "How do I renew the vManage certificate?"
+        expanded = normalize_query(q)
+        assert "renewal" in expanded
+
+    def test_normalize_no_match_unchanged(self):
+        from netdocs.retriever.hybrid import normalize_query
+
+        q = "What BGP ASN does Contoso use?"
+        assert normalize_query(q) == q
+
+
+class TestOutOfScopeDetection:
+    def test_snmp_community_string_is_ood(self):
+        from netdocs.retriever.hybrid import is_out_of_scope
+
+        assert is_out_of_scope("What is the SNMP community string used on Contoso devices?")
+
+    def test_wifi_password_is_ood(self):
+        from netdocs.retriever.hybrid import is_out_of_scope
+
+        assert is_out_of_scope("What is the WiFi password for the Contoso guest network?")
+
+    def test_vendor_sla_is_ood(self):
+        from netdocs.retriever.hybrid import is_out_of_scope
+
+        assert is_out_of_scope("What is the SLA for Contoso's SD-WAN vendor support contract?")
+
+    def test_aci_fabric_is_ood(self):
+        from netdocs.retriever.hybrid import is_out_of_scope
+
+        assert is_out_of_scope("How do I configure Cisco ACI fabric for the London data centre?")
+
+    def test_bgp_procedure_is_not_ood(self):
+        from netdocs.retriever.hybrid import is_out_of_scope
+
+        assert not is_out_of_scope("What is the runbook procedure when a BGP session flaps?")
+
+    def test_design_doc_question_is_not_ood(self):
+        from netdocs.retriever.hybrid import is_out_of_scope
+
+        assert not is_out_of_scope("How does the SD-WAN overlay connect hub and branch sites?")
+
+    def test_ood_forces_refusal_in_generator(self):
+        """is_out_of_scope() causes generate_answer to refuse even with high score."""
+        from netdocs.llm.generator import generate_answer
+        from netdocs.llm.client import FakeLLMClient
+
+        chunk = _make_chunk("SD-001__000", text="SD-WAN design text")
+        chunk["rerank_score"] = 10.0  # artificially high score
+        result = generate_answer(
+            "What is the SLA for Contoso's SD-WAN vendor support contract?",
+            [chunk],
+            FakeLLMClient(canned_answer="The SLA is 4 hours."),
+            confidence_threshold=-99.0,  # disable score-based threshold
+        )
+        assert result.refused
+        assert result.refusal_reason == "low_confidence"
+
 
 class TestDocTypeBoost:
     def _make_chunk(self, doc_type: str, text: str = "BGP flap") -> dict:
