@@ -3,8 +3,12 @@ from __future__ import annotations
 """
 Agent tool implementations for NetDocs.
 
-Four tools are registered:
+Five tools are registered:
 
+    list_configs          — return the available device config files/hostnames
+                            (from data/raw/configs/) with site ID and vendor if
+                            derivable from the filename.  Use this first when the
+                            user asks a generic question and no device is named.
     parse_config          — extract BGP neighbors, ASNs, route-maps, and
                             prefix-lists from a config file in data/raw/configs/.
     check_neighbor_state  — look up live (mock) BGP neighbor state from the
@@ -38,6 +42,57 @@ logger = logging.getLogger(__name__)
 _CONFIGS_DIR = Path("data/raw/configs")
 _TICKETS_DIR = Path("data/raw/tickets")
 _MOCK_INVENTORY = Path("data/mock/neighbor_inventory.json")
+
+
+# ---------------------------------------------------------------------------
+# Tool: parse_config
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Tool: list_configs
+# ---------------------------------------------------------------------------
+
+def list_configs(args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
+    """Return all available device config files with site ID and vendor.
+
+    Args (in ``args`` dict):
+        (none required)
+
+    Returns:
+        dict with keys:
+            devices (list[dict]) — each entry has:
+                hostname (str), filename (str),
+                site_id (str, best-effort), vendor (str, best-effort)
+    """
+    if not _CONFIGS_DIR.exists():
+        logger.warning("list_configs: configs directory not found at %s", _CONFIGS_DIR)
+        return {"devices": []}
+
+    devices: list[dict[str, Any]] = []
+    for cfg_path in sorted(_CONFIGS_DIR.glob("*.cfg")):
+        hostname = cfg_path.stem  # e.g. "LON-DC01-RTR01"
+
+        # Best-effort site ID: first two dash-separated tokens (e.g. "LON-DC01")
+        parts = hostname.split("-")
+        site_id = "-".join(parts[:2]) if len(parts) >= 2 else hostname
+
+        # Best-effort vendor from filename suffix token
+        vendor = "unknown"
+        suffix = parts[-1].upper() if parts else ""
+        if suffix.startswith("RTR") or suffix.startswith("VE"):
+            vendor = "cisco-ios-xe"
+        elif suffix.startswith("COR"):
+            vendor = "cisco-ios-xe"
+
+        devices.append({
+            "hostname": hostname,
+            "filename": cfg_path.name,
+            "site_id": site_id,
+            "vendor": vendor,
+        })
+
+    logger.info("list_configs: found %d device configs", len(devices))
+    return {"devices": devices}
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +447,18 @@ class ToolSpec:
 
 
 TOOL_REGISTRY: dict[str, ToolSpec] = {
+    "list_configs": ToolSpec(
+        name="list_configs",
+        description=(
+            "List all available device config files/hostnames in the data directory, "
+            "with site ID and vendor where derivable. "
+            "Call this first when the user asks a generic question and no specific "
+            "device or filename is mentioned. No args required."
+        ),
+        fn=list_configs,
+        requires_approval=False,
+        timeout_seconds=5.0,
+    ),
     "parse_config": ToolSpec(
         name="parse_config",
         description=(

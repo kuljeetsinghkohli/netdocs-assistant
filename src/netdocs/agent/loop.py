@@ -448,7 +448,18 @@ def _parse_llm_action(raw: str, question: str, tools: dict[str, ToolSpec]) -> di
 
     # 3. Extractive / keyword fallback — pick first matching tool or answer
     q_lower = question.lower()
+
+    # If no specific device is named in the question, prefer list_configs so the
+    # agent can discover available devices rather than asking the user.
+    _no_device_named = not _guess_device_from_question(question)
+
     heuristics = [
+        # Generic "which routers…" or device-less BGP state questions → discover first
+        (["which router", "which routers", "all router", "all routers",
+          "all device", "all devices", "have bgp", "bgp peers that are",
+          "bgp neighbors that are", "routers have bgp", "routers with bgp"],
+         "list_configs",
+         lambda q: {}),  # noqa: ARG005
         (["parse config", "bgp config", "prefix-list", "route-map", "asn", "config file"],
          "parse_config",
          lambda q: {"filename": _guess_device_from_question(q)}),

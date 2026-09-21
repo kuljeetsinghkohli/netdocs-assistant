@@ -555,6 +555,145 @@ class TestAgentLoopFailurePaths:
 
 
 # ---------------------------------------------------------------------------
+# list_configs tool
+# ---------------------------------------------------------------------------
+
+class TestListConfigs:
+    def test_returns_all_configs(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        _patch_paths(monkeypatch, configs_dir, mock_inventory, tickets_dir)
+        from netdocs.agent.tools import list_configs
+
+        result = list_configs({})
+        assert len(result["devices"]) == 1
+        assert result["devices"][0]["hostname"] == "TEST-RTR01"
+        assert result["devices"][0]["filename"] == "TEST-RTR01.cfg"
+
+    def test_site_id_extracted(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        _patch_paths(monkeypatch, configs_dir, mock_inventory, tickets_dir)
+        from netdocs.agent.tools import list_configs
+
+        result = list_configs({})
+        device = result["devices"][0]
+        # "TEST-RTR01" splits into ["TEST", "RTR01"] → site_id = "TEST-RTR01"
+        assert device["site_id"] == "TEST-RTR01"
+
+    def test_empty_dir_returns_empty(self, monkeypatch, tmp_path, mock_inventory, tickets_dir):
+        empty_dir = tmp_path / "empty_configs"
+        empty_dir.mkdir()
+        import netdocs.agent.tools as tools_mod
+        monkeypatch.setattr(tools_mod, "_CONFIGS_DIR", empty_dir)
+        from netdocs.agent.tools import list_configs
+
+        result = list_configs({})
+        assert result["devices"] == []
+
+    def test_missing_dir_returns_empty(self, monkeypatch, tmp_path, mock_inventory, tickets_dir):
+        import netdocs.agent.tools as tools_mod
+        monkeypatch.setattr(tools_mod, "_CONFIGS_DIR", tmp_path / "nonexistent")
+        from netdocs.agent.tools import list_configs
+
+        result = list_configs({})
+        assert result["devices"] == []
+
+
+# ---------------------------------------------------------------------------
+# AgentLoop — list_configs triggered by generic question
+# ---------------------------------------------------------------------------
+
+class TestListConfigsDiscovery:
+    """Verify that a generic question (no device named) triggers list_configs first."""
+
+    def test_generic_bgp_question_triggers_list_configs(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        """When the LLM is a fake that returns list_configs first, the loop executes it."""
+        _patch_paths(monkeypatch, configs_dir, mock_inventory, tickets_dir)
+        from netdocs.agent.loop import AgentLoop
+        from netdocs.agent.tools import ToolSpec, TOOL_REGISTRY
+
+        list_configs_called: list[dict] = []
+        check_neighbor_called: list[dict] = []
+
+        def _mock_list_configs(args: dict) -> dict:
+            list_configs_called.append(args)
+            return {
+                "devices": [
+                    {"hostname": "TEST-RTR01", "filename": "TEST-RTR01.cfg",
+                     "site_id": "TEST-RTR", "vendor": "cisco-ios-xe"},
+                ]
+            }
+
+        def _mock_check_neighbor(args: dict) -> dict:
+            check_neighbor_called.append(args)
+            return {"device": args.get("device", ""), "neighbors": []}
+
+        registry = {
+            "list_configs": ToolSpec(
+                name="list_configs",
+                description="list configs",
+                fn=_mock_list_configs,
+                timeout_seconds=5.0,
+            ),
+            "check_neighbor_state": ToolSpec(
+                name="check_neighbor_state",
+                description="check neighbor state",
+                fn=_mock_check_neighbor,
+                timeout_seconds=5.0,
+            ),
+        }
+
+        # Fake LLM: first call → list_configs, second → check_neighbor_state, third → final_answer
+        responses = [
+            json.dumps({"action": "tool_call", "tool": "list_configs", "args": {}}),
+            json.dumps({"action": "tool_call", "tool": "check_neighbor_state",
+                        "args": {"device": "TEST-RTR01"}}),
+            json.dumps({"action": "final_answer", "answer": "No BGP peers are down."}),
+        ]
+        llm = _make_fake_llm(responses)
+        loop = AgentLoop(llm, tool_registry=registry, max_steps=5, require_approval=False)
+        result = loop.run("Which routers have BGP peers that are down?")
+
+        # list_configs must have been called
+        assert list_configs_called, "list_configs was not called for a generic question"
+
+        # list_configs must be the FIRST tool call in the step trace
+        tool_steps = [s for s in result.steps if getattr(s, "type", "") == "tool_call"]
+        assert tool_steps, "No tool calls recorded"
+        assert tool_steps[0].tool == "list_configs", (
+            f"First tool called was {tool_steps[0].tool!r}, expected 'list_configs'"
+        )
+
+    def test_extractive_generic_question_triggers_list_configs(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        """With the extractive (heuristic) LLM, a generic BGP question routes to list_configs."""
+        _patch_paths(monkeypatch, configs_dir, mock_inventory, tickets_dir)
+        from netdocs.llm.client import ExtractiveClient
+        from netdocs.agent.loop import AgentLoop
+        from netdocs.agent.tools import ToolSpec
+
+        captured: list[dict] = []
+
+        def _mock_list_configs(args: dict) -> dict:
+            captured.append({"tool": "list_configs", **args})
+            return {"devices": []}
+
+        registry = {
+            "list_configs": ToolSpec(
+                name="list_configs",
+                description="list configs",
+                fn=_mock_list_configs,
+                timeout_seconds=5.0,
+            ),
+        }
+
+        llm = ExtractiveClient()
+        loop = AgentLoop(llm, tool_registry=registry, max_steps=3, require_approval=False)
+        result = loop.run("Which routers have BGP peers that are down?")
+
+        assert any(
+            getattr(s, "tool", "") == "list_configs"
+            for s in result.steps
+        ), "Expected list_configs in steps for generic question"
+
+
+# ---------------------------------------------------------------------------
 # RetryingLLMClient — 503 retry and degraded fallback
 # ---------------------------------------------------------------------------
 

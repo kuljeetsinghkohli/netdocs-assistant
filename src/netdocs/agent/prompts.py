@@ -36,6 +36,12 @@ B) Give a final answer (when you have enough information):
 Do NOT output anything outside the JSON object.
 Do NOT call a tool you have already called with the same arguments.
 If you cannot answer and no tool will help, output a final_answer explaining why.
+
+DEVICE DISCOVERY RULE:
+If the user's question refers to "all routers", "which routers", "all devices",
+or does NOT name a specific device or filename, you MUST call list_configs first
+to discover the available devices before calling parse_config or check_neighbor_state.
+Never ask the user for a filename or device name that you can discover with list_configs.
 """
 
 DECISION_USER = """\
@@ -55,6 +61,7 @@ What is the next action?
 EXTRACTIVE_DECISION_TEMPLATE = """\
 Based on the question, determine whether a tool call is needed.
 Question keywords that suggest tools:
+  - which routers / all devices / all routers / generic (no device named) → list_configs
   - config / neighbor / ASN / route-map / prefix-list → parse_config
   - neighbor state / session / bgp state / up/down → check_neighbor_state
   - change plan / CR / rollout / implement → draft_change_plan
