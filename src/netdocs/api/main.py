@@ -155,6 +155,7 @@ async def ask(request: AskRequest) -> AskResponse:
         refused=result.refused,
         refusal_reason=result.refusal_reason,
         confidence=result.confidence,
+        degraded=result.degraded,
     )
 
 

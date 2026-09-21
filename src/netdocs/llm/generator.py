@@ -73,6 +73,8 @@ class AnswerResponse:
                         ``"empty_generation"``, or ``""`` when not refused.
         confidence:     The top reranker score (or RRF score) of the best chunk.
                         ``0.0`` when no chunks were retrieved.
+        degraded:       ``True`` when the LLM fell back to the extractive
+                        provider because the Gemini chain was exhausted.
     """
 
     answer: str
@@ -80,6 +82,7 @@ class AnswerResponse:
     refused: bool = False
     refusal_reason: str = ""
     confidence: float = 0.0
+    degraded: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +291,26 @@ def generate_answer(
         confidence,
     )
 
-    raw_answer = llm_client.complete(system=system, user=query)
+    from netdocs.llm.client import AllModelsFailedError, ExtractiveClient, DEGRADED_PREFIX
+
+    _degraded = False
+    try:
+        raw_answer = llm_client.complete(system=system, user=query)
+    except AllModelsFailedError as exc:
+        logger.error(
+            "generate_answer: Gemini fallback chain exhausted (%s). "
+            "Falling back to extractive answer (degraded mode).",
+            exc,
+        )
+        raw_answer = DEGRADED_PREFIX + ExtractiveClient().complete(
+            system=system, user=query
+        )
+
+    # Detect degraded prefix (may come from AllModelsFailedError fallback above,
+    # or from RetryingLLMClient's own extractive fallback path).
+    if raw_answer.startswith(DEGRADED_PREFIX):
+        _degraded = True
+        raw_answer = raw_answer[len(DEGRADED_PREFIX):]
 
     # --- Empty generation refusal ---
     if not raw_answer.strip():
@@ -301,6 +323,7 @@ def generate_answer(
             refused=True,
             refusal_reason=REFUSAL_EMPTY_GENERATION,
             confidence=confidence,
+            degraded=_degraded,
         )
 
     # --- LLM declined ---
@@ -314,10 +337,19 @@ def generate_answer(
             refused=True,
             refusal_reason=REFUSAL_LLM_DECLINED,
             confidence=confidence,
+            degraded=_degraded,
         )
 
     citations = _parse_citations(raw_answer, chunks)
     rendered = render_citations(raw_answer, citations)
+
+    # Prepend the user-facing degraded note when operating in degraded mode.
+    _DEGRADED_NOTE = (
+        "⚠️ The LLM provider is rate-limited or quota-exhausted; "
+        "showing a simplified answer based on available documentation."
+    )
+    if _degraded and _DEGRADED_NOTE not in rendered:
+        rendered = f"{_DEGRADED_NOTE}\n\n{rendered}"
 
     return AnswerResponse(
         answer=rendered.strip(),
@@ -325,4 +357,5 @@ def generate_answer(
         refused=False,
         refusal_reason="",
         confidence=confidence,
+        degraded=_degraded,
     )

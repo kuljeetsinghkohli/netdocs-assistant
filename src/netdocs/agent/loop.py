@@ -44,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from dataclasses import dataclass, field
 from typing import Any, Callable, Union
 
-from netdocs.llm.client import DEGRADED_PREFIX, ExtractiveClient
+from netdocs.llm.client import DEGRADED_PREFIX, ExtractiveClient, AllModelsFailedError
 
 from netdocs.agent.prompts import (
     DECISION_SYSTEM,
@@ -64,7 +64,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _is_llm_quota_or_rate_error(exc: Exception) -> bool:
-    """Return True if *exc* looks like a 429, 503, quota, or rate-limit error."""
+    """Return True if *exc* looks like a 429, 503, quota, rate-limit, or
+    chain-exhausted (AllModelsFailedError) error."""
+    if isinstance(exc, AllModelsFailedError):
+        return True
     from netdocs.llm.client import _is_retryable_error, _is_daily_quota_error  # noqa: PLC0415
     return _is_retryable_error(exc) or _is_daily_quota_error(exc)
 

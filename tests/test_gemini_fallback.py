@@ -324,3 +324,191 @@ class TestFailedModelSkipped:
         assert r2 == "ok"
         assert "model-x" not in call_log
         assert call_log == ["model-y"]
+
+
+# ===========================================================================
+# AllModelsFailedError — sentinel exception raised by GeminiClient
+# ===========================================================================
+
+class TestAllModelsFailedError:
+    def test_all_models_fail_raises_all_models_failed_error(self, monkeypatch):
+        """GeminiClient raises AllModelsFailedError (not bare RuntimeError) when
+        the entire fallback chain is exhausted."""
+        from netdocs.llm.client import AllModelsFailedError
+
+        client = _bare_client("model-a")
+        _patch_fallbacks(monkeypatch, ["model-b"])
+
+        def fake_call_with_model(model, prompt, temp, mtok, *, use_thinking=True):
+            raise _FakeException("429 quota exhausted", status_code=429)
+
+        client._call_with_model = fake_call_with_model  # type: ignore
+
+        with pytest.raises(AllModelsFailedError):
+            client.complete("sys", "user")
+
+    def test_all_models_failed_error_is_runtime_error_subclass(self):
+        """AllModelsFailedError is a subclass of RuntimeError for backward compat."""
+        from netdocs.llm.client import AllModelsFailedError
+
+        err = AllModelsFailedError("boom")
+        assert isinstance(err, RuntimeError)
+
+    def test_retrying_client_catches_all_models_failed_degrades(self, monkeypatch):
+        """RetryingLLMClient catches AllModelsFailedError and returns DEGRADED answer."""
+        from netdocs.llm.client import RetryingLLMClient, AllModelsFailedError, DEGRADED_PREFIX
+
+        client = _bare_client("model-a")
+        _patch_fallbacks(monkeypatch, ["model-b"])
+
+        def fake_call_with_model(model, prompt, temp, mtok, *, use_thinking=True):
+            raise _FakeException("429 quota exhausted", status_code=429)
+
+        client._call_with_model = fake_call_with_model  # type: ignore
+
+        retrying = RetryingLLMClient(client, max_attempts=1, _sleep=lambda s: None)
+
+        system = (
+            "--- [Source: DD-001__000 | design_doc | Overview] ---\n"
+            "BGP hold timer is 90 seconds.\n"
+        )
+        result = retrying.complete(system, "What is the BGP hold timer?")
+
+        assert result.startswith(DEGRADED_PREFIX), (
+            f"Expected DEGRADED prefix, got: {result[:60]!r}"
+        )
+        assert "90 seconds" in result or "Overview" in result
+
+    def test_agent_loop_degrades_on_all_models_failed(self, monkeypatch):
+        """AgentLoop returns degraded=True (no exception) when GeminiClient
+        raises AllModelsFailedError on every LLM call."""
+        from netdocs.llm.client import AllModelsFailedError, BaseLLMClient
+        from netdocs.agent.loop import AgentLoop
+        from netdocs.agent.tools import ToolSpec
+
+        def _mock_neighbor(args: dict) -> dict:
+            return {"device": args.get("device", "TEST"), "neighbors": []}
+
+        registry = {
+            "check_neighbor_state": ToolSpec(
+                name="check_neighbor_state",
+                description="check BGP neighbor state",
+                fn=_mock_neighbor,
+                timeout_seconds=5.0,
+            ),
+        }
+
+        class _ChainExhaustedLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise AllModelsFailedError("All Gemini models failed")
+
+        loop = AgentLoop(
+            _ChainExhaustedLLM(),
+            tool_registry=registry,
+            max_steps=5,
+            require_approval=False,
+        )
+        result = loop.run("Is the BGP session on LON-DC01-RTR01 up?")
+
+        assert result.degraded is True, "Expected degraded=True when chain is exhausted"
+        assert result.final_answer.strip() != "", "Expected non-empty answer in degraded mode"
+
+    def test_agent_loop_chain_exhausted_tool_calls_in_trace(self, monkeypatch):
+        """When GeminiClient raises AllModelsFailedError, tool calls executed via
+        the heuristic fallback are still present in the step trace."""
+        from netdocs.llm.client import AllModelsFailedError, BaseLLMClient
+        from netdocs.agent.loop import AgentLoop
+        from netdocs.agent.tools import ToolSpec
+
+        def _mock_neighbor(args: dict) -> dict:
+            return {"device": args.get("device", "TEST"), "neighbors": []}
+
+        registry = {
+            "check_neighbor_state": ToolSpec(
+                name="check_neighbor_state",
+                description="check BGP neighbor state",
+                fn=_mock_neighbor,
+                timeout_seconds=5.0,
+            ),
+        }
+
+        class _ChainExhaustedLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise AllModelsFailedError("All Gemini models failed")
+
+        loop = AgentLoop(
+            _ChainExhaustedLLM(),
+            tool_registry=registry,
+            max_steps=5,
+            require_approval=False,
+        )
+        result = loop.run("Is the BGP session on LON-DC01-RTR01 up?")
+
+        tool_steps = [s for s in result.steps if getattr(s, "type", "") == "tool_call"]
+        assert tool_steps, "Expected at least one tool_call step in the trace"
+        assert any(s.tool == "check_neighbor_state" for s in tool_steps)
+
+    def test_ask_path_degrades_on_all_models_failed(self):
+        """generate_answer returns degraded=True (no exception) when the LLM
+        raises AllModelsFailedError."""
+        from netdocs.llm.client import AllModelsFailedError, BaseLLMClient
+        from netdocs.llm.generator import generate_answer
+
+        class _ChainExhaustedLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise AllModelsFailedError("All Gemini models failed")
+
+        chunks = [
+            {
+                "id": "DD-001__000",
+                "text": "BGP hold timer is 90 seconds.",
+                "metadata": {
+                    "source_file": "design_doc.md",
+                    "doc_type": "design_doc",
+                    "section_heading": "BGP Timers",
+                },
+                "rerank_score": 0.9,
+            }
+        ]
+        result = generate_answer(
+            "What is the BGP hold timer?",
+            chunks,
+            _ChainExhaustedLLM(),
+            confidence_threshold=0.0,
+        )
+
+        assert result.degraded is True, "Expected degraded=True when chain is exhausted"
+        assert result.answer.strip() != "", "Expected non-empty answer in degraded mode"
+        # No exception should have propagated
+
+    def test_ask_path_chain_exhausted_200_no_500(self):
+        """generate_answer must not raise when AllModelsFailedError occurs —
+        the caller (API route) must be able to return 200."""
+        from netdocs.llm.client import AllModelsFailedError, BaseLLMClient
+        from netdocs.llm.generator import generate_answer
+
+        class _ChainExhaustedLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise AllModelsFailedError("All Gemini models failed")
+
+        chunks = [
+            {
+                "id": "RB-001__000",
+                "text": "Clear BGP session using: clear ip bgp <neighbor>.",
+                "metadata": {
+                    "source_file": "runbook.md",
+                    "doc_type": "runbook",
+                    "section_heading": "BGP Reset Procedure",
+                },
+                "rerank_score": 0.85,
+            }
+        ]
+        # Must complete without raising
+        result = generate_answer(
+            "How do I reset a BGP session?",
+            chunks,
+            _ChainExhaustedLLM(),
+            confidence_threshold=0.0,
+        )
+        assert result is not None
+        assert result.degraded is True

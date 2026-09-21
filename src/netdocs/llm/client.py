@@ -42,6 +42,22 @@ from netdocs.config import settings
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Sentinel exception — raised when every model in the Gemini fallback chain
+# fails with a quota / not-found / invalid-argument error.  Callers that
+# wrap GeminiClient (RetryingLLMClient, AgentLoop, generate_answer) catch
+# this specific type to degrade gracefully instead of returning 500.
+# ---------------------------------------------------------------------------
+
+class AllModelsFailedError(RuntimeError):
+    """Raised by :class:`GeminiClient` when every model in the fallback chain
+    has been exhausted by quota, 404, or 400 errors.
+
+    Callers should catch this and fall back to the extractive / heuristic
+    provider rather than propagating a 500 to the end-user.
+    """
+
+
 class BaseLLMClient(ABC):
     """Abstract LLM client interface."""
 
@@ -512,9 +528,9 @@ class GeminiClient(BaseLLMClient):
                     # Any other error is not a fallback trigger — re-raise.
                     raise
 
-        # All candidates failed — propagate to the RetryingLLMClient which
-        # will fall back to extractive (degraded) mode.  Never return a 500.
-        raise RuntimeError(
+        # All candidates failed — raise the sentinel so callers can degrade
+        # gracefully (extractive fallback) instead of returning 500.
+        raise AllModelsFailedError(
             f"All Gemini models in the fallback chain failed. "
             f"Last error: {last_exc}. "
             "Falling back to extractive provider."
@@ -711,6 +727,17 @@ class RetryingLLMClient(BaseLLMClient):
                 return self._inner.complete(
                     system, user, temperature=temperature, max_tokens=max_tokens
                 )
+            except AllModelsFailedError as exc:
+                # The Gemini chain exhausted all models — degrade immediately.
+                logger.error(
+                    "RetryingLLMClient: Gemini fallback chain exhausted (%s). "
+                    "Falling back to extractive provider (degraded mode).",
+                    exc,
+                )
+                result = self._fallback.complete(
+                    system, user, temperature=temperature, max_tokens=max_tokens
+                )
+                return DEGRADED_PREFIX + result
             except Exception as exc:
                 if not _is_retryable_error(exc):
                     raise

@@ -83,6 +83,10 @@ class AskResponse(BaseModel):
         ),
     )
     confidence: float = Field(description="Retrieval confidence score of the top result.")
+    degraded: bool = Field(
+        default=False,
+        description="True when the LLM fell back to extractive (Gemini chain exhausted).",
+    )
 
 
 # ---------------------------------------------------------------------------
