@@ -22,10 +22,18 @@ Provider selection order (when ``NETDOCS_LLM_PROVIDER`` is not explicitly set
 or is left as the legacy default "openai"):
   1. If ``GEMINI_API_KEY`` is set  → gemini
   2. Otherwise                     → extractive
+
+Retry behaviour
+---------------
+The :class:`RetryingLLMClient` wrapper adds automatic retry with exponential
+backoff for transient HTTP errors (429 Rate-Limit, 503 Service-Unavailable).
+It wraps any ``BaseLLMClient`` and, after **3 failed attempts**, falls back to
+:class:`ExtractiveClient` and marks the response as "degraded" by prepending
+``[DEGRADED] `` to the returned text.  No exception is raised to the caller.
 """
 
 import logging
-import os
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -447,6 +455,111 @@ class FakeLLMClient(BaseLLMClient):
             cite_str = "  ".join(f"[doc:{c}]" for c in citations[:2])
             return f"Fake answer based on context. {cite_str}"
         return "Fake answer: no relevant documentation found."
+
+
+# ---------------------------------------------------------------------------
+# Retrying wrapper — 429 / 503 with exponential backoff + extractive fallback
+# ---------------------------------------------------------------------------
+
+#: HTTP status codes that trigger a retry.
+_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 503})
+#: Maximum number of attempts (first call + 2 retries = 3 total).
+_RETRY_MAX_ATTEMPTS: int = 3
+#: Base delay in seconds for the first retry; doubles each attempt.
+_RETRY_BASE_DELAY: float = 1.0
+
+#: Sentinel prefix added when the extractive fallback is used.
+DEGRADED_PREFIX = "[DEGRADED] "
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Return True if *exc* looks like a 429 or 503 HTTP error."""
+    msg = str(exc).lower()
+    # Handle openai, httpx, and generic HTTP client exceptions by inspecting
+    # the status_code attribute or the message text.
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status in _RETRYABLE_STATUS_CODES:
+        return True
+    # Fallback: keyword scan of the string representation
+    return "429" in msg or "503" in msg or "rate limit" in msg or "service unavailable" in msg
+
+
+class RetryingLLMClient(BaseLLMClient):
+    """Wraps any :class:`BaseLLMClient` with retry + graceful degradation.
+
+    On a 429 or 503 error the call is retried up to ``max_attempts`` times
+    with exponential backoff (``base_delay * 2**attempt`` seconds).  After all
+    retries are exhausted the call is delegated to :class:`ExtractiveClient`
+    and the returned text is prefixed with :data:`DEGRADED_PREFIX` so callers
+    can detect the degraded state.
+
+    Args:
+        inner:        The real LLM client to wrap.
+        max_attempts: Total attempts including the first call (default: 3).
+        base_delay:   Seconds before the first retry (doubles each time).
+        _sleep:       Override ``time.sleep`` — used in tests to avoid delays.
+    """
+
+    def __init__(
+        self,
+        inner: BaseLLMClient,
+        max_attempts: int = _RETRY_MAX_ATTEMPTS,
+        base_delay: float = _RETRY_BASE_DELAY,
+        *,
+        _sleep=time.sleep,
+    ) -> None:
+        self._inner = inner
+        self._max_attempts = max_attempts
+        self._base_delay = base_delay
+        self._sleep = _sleep
+        self._fallback = ExtractiveClient()
+
+    def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        last_exc: Exception | None = None
+        for attempt in range(self._max_attempts):
+            try:
+                return self._inner.complete(
+                    system, user, temperature=temperature, max_tokens=max_tokens
+                )
+            except Exception as exc:
+                if not _is_retryable_error(exc):
+                    raise
+                last_exc = exc
+                # Only sleep if there is a subsequent attempt to make
+                if attempt + 1 < self._max_attempts:
+                    delay = self._base_delay * (2 ** attempt)
+                    logger.warning(
+                        "RetryingLLMClient: attempt %d/%d failed (%s). Retrying in %.1fs.",
+                        attempt + 1,
+                        self._max_attempts,
+                        exc,
+                        delay,
+                    )
+                    self._sleep(delay)
+                else:
+                    logger.warning(
+                        "RetryingLLMClient: attempt %d/%d failed (%s). No more retries.",
+                        attempt + 1,
+                        self._max_attempts,
+                        exc,
+                    )
+
+        # All retries exhausted — fall back to extractive
+        logger.error(
+            "RetryingLLMClient: all %d attempts failed (%s). "
+            "Falling back to extractive provider (degraded mode).",
+            self._max_attempts,
+            last_exc,
+        )
+        result = self._fallback.complete(system, user, temperature=temperature, max_tokens=max_tokens)
+        return DEGRADED_PREFIX + result
 
 
 # ---------------------------------------------------------------------------

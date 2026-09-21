@@ -10,6 +10,7 @@ Sub-commands::
                                                [--date-from YYYY-MM-DD] [--date-to YYYY-MM-DD]
                                                [--top-k N]
     python -m netdocs eval [--top-k N] [--out PATH] [--threshold FLOAT]
+    python -m netdocs agent "your question here" [--max-steps N] [--approve]
 """
 
 import argparse
@@ -139,6 +140,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip cross-encoder reranking (faster but lower quality)",
     )
 
+    # --- agent ---
+    agent_p = sub.add_parser(
+        "agent",
+        help="Answer a question using the agent tool-calling loop",
+    )
+    agent_p.add_argument("question", help="The question for the agent to answer")
+    agent_p.add_argument(
+        "--max-steps",
+        dest="max_steps",
+        type=int,
+        default=8,
+        help="Maximum tool-call iterations before the agent aborts (default: 8)",
+    )
+    agent_p.add_argument(
+        "--approve",
+        dest="require_approval",
+        action="store_true",
+        help=(
+            "Gate state-changing tools behind human approval prompts. "
+            "When omitted, state-changing tools run without prompting."
+        ),
+    )
+
     # --- eval ---
     eval_p = sub.add_parser(
         "eval",
@@ -169,7 +193,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path for the Markdown report (default: reports/eval_report.md)",
     )
 
-    return parser.parse_args(argv)
+    return parser.parse_args(argv)  # type: ignore[return-value]
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
@@ -502,6 +526,69 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return 1 if has_misses else 0
 
 
+def cmd_agent(args: argparse.Namespace) -> int:
+    """Execute the agent command.
+
+    Returns:
+        Exit code (0 = success, 1 = failure / aborted).
+    """
+    _configure_logging(settings.log_level)
+
+    from netdocs.agent.loop import run_agent
+    from netdocs.llm.client import get_llm_client
+
+    console.rule("[bold cyan]NetDocs Agent")
+    console.print(f"  Question   : [bold]{args.question}[/]")
+    console.print(f"  Max steps  : [green]{args.max_steps}[/]")
+    console.print(f"  Approval   : [green]{'yes' if args.require_approval else 'no (auto)'}[/]")
+    console.print()
+
+    t0 = time.perf_counter()
+    try:
+        llm = get_llm_client()
+        result = run_agent(
+            args.question,
+            llm_client=llm,
+            max_steps=args.max_steps,
+            require_approval=args.require_approval,
+        )
+    except Exception as exc:
+        console.print(f"[red]ERROR:[/] {exc}")
+        logger.exception("agent command failed")
+        return 1
+
+    elapsed = time.perf_counter() - t0
+
+    # --- Print step trace ---
+    if result.steps:
+        console.rule("[dim]Agent Steps")
+        for i, step in enumerate(result.steps, 1):
+            stype = getattr(step, "type", "?")
+            if stype == "tool_call":
+                console.print(
+                    f"  [cyan]Step {i}:[/] tool_call → [green]{step.tool}[/]"  # type: ignore[union-attr]
+                    f"  ({step.duration_ms:.0f}ms)"  # type: ignore[union-attr]
+                )
+            elif stype == "error":
+                console.print(
+                    f"  [red]Step {i}:[/] error in [yellow]{step.tool}[/]"  # type: ignore[union-attr]
+                    f" ({step.error_kind}): {step.error}"  # type: ignore[union-attr]
+                )
+            elif stype == "final_answer":
+                console.print(f"  [dim]Step {i}:[/] final_answer")
+
+    # --- Print final answer ---
+    console.print()
+    if result.aborted:
+        console.print(f"[yellow]⚠ Agent aborted: {result.abort_reason}[/]")
+    if result.degraded:
+        console.print("[yellow]⚠ LLM degraded (fell back to extractive provider)[/]")
+    console.rule("[bold green]Agent Answer")
+    console.print(result.final_answer or "[dim](no answer generated)[/]")
+    console.print(f"\n[dim]steps={len(result.steps)}  elapsed={elapsed:.1f}s[/]")
+    return 1 if result.aborted else 0
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     args = _parse_args(argv)
@@ -511,6 +598,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(cmd_ask(args))
     elif args.command == "eval":
         sys.exit(cmd_eval(args))
+    elif args.command == "agent":
+        sys.exit(cmd_agent(args))
 
 
 if __name__ == "__main__":

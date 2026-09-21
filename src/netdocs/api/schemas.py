@@ -86,6 +86,58 @@ class AskResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# /agent
+# ---------------------------------------------------------------------------
+
+class AgentStepOut(BaseModel):
+    """A single step in the agent's execution trace."""
+
+    type: str = Field(description="Step type: 'tool_call', 'error', or 'final_answer'.")
+    tool: str = Field(default="", description="Tool name (for tool_call and error steps).")
+    args: dict = Field(default_factory=dict)
+    result: Any = Field(default=None, description="Tool result (for tool_call steps).")
+    error: str = Field(default="", description="Error message (for error steps).")
+    error_kind: str = Field(default="")
+    duration_ms: float = Field(default=0.0)
+    answer: str = Field(default="", description="Final answer text (for final_answer steps).")
+
+
+class AgentRequest(BaseModel):
+    """Request body for POST /agent."""
+
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=4000,
+        description="The question for the agent to answer.",
+        examples=["Is the BGP session with BT MPLS on LON-DC01-RTR01 up?"],
+    )
+    max_steps: Optional[int] = Field(
+        default=8,
+        ge=1,
+        le=20,
+        description="Maximum tool-call iterations (default: 8).",
+    )
+    require_approval: bool = Field(
+        default=False,
+        description=(
+            "When True, state-changing tools (draft_change_plan) are NOT auto-approved "
+            "and will be skipped in the API context."
+        ),
+    )
+
+
+class AgentResponse(BaseModel):
+    """Response body for POST /agent."""
+
+    answer: str = Field(description="The agent's final answer.")
+    steps: list[AgentStepOut] = Field(default_factory=list)
+    aborted: bool = Field(default=False)
+    abort_reason: str = Field(default="")
+    degraded: bool = Field(default=False, description="True when LLM fell back to extractive.")
+
+
+# ---------------------------------------------------------------------------
 # /health
 # ---------------------------------------------------------------------------
 

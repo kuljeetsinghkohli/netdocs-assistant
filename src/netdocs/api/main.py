@@ -19,7 +19,16 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
-from netdocs.api.schemas import AskFilters, AskRequest, AskResponse, CitationOut, HealthResponse
+from netdocs.api.schemas import (
+    AgentRequest,
+    AgentResponse,
+    AgentStepOut,
+    AskFilters,
+    AskRequest,
+    AskResponse,
+    CitationOut,
+    HealthResponse,
+)
 from netdocs.config import settings
 
 logger = logging.getLogger(__name__)
@@ -146,4 +155,76 @@ async def ask(request: AskRequest) -> AskResponse:
         refused=result.refused,
         refusal_reason=result.refusal_reason,
         confidence=result.confidence,
+    )
+
+
+@app.post("/agent", response_model=AgentResponse, tags=["agent"])
+async def agent(request: AgentRequest) -> AgentResponse:
+    """Answer a question using the agent tool-calling loop.
+
+    The agent decides whether to answer directly from documents or to invoke
+    one or more tools (parse_config, check_neighbor_state, draft_change_plan,
+    find_related_tickets) before synthesising a final answer.
+
+    State-changing tools (draft_change_plan) require ``require_approval=False``
+    in the request body to auto-approve them in the API context.
+    """
+    from netdocs.agent.loop import AgentLoop, ToolCallStep, ErrorStep, FinalAnswerStep
+
+    llm = app.state.llm
+
+    # In the API, approval prompts are impossible — use a deny-all callback
+    # when require_approval=True (so state-changing tools are skipped).
+    def _api_deny_approval(tool_name: str, args: dict) -> bool:
+        logger.warning(
+            "/agent: auto-denying approval for state-changing tool %r "
+            "(set require_approval=false to auto-approve)",
+            tool_name,
+        )
+        return False
+
+    loop = AgentLoop(
+        llm_client=llm,
+        max_steps=request.max_steps or 8,
+        require_approval=request.require_approval,
+        approval_callback=_api_deny_approval,
+    )
+
+    agent_result = loop.run(request.question)
+
+    # Serialise steps
+    steps_out: list[AgentStepOut] = []
+    for step in agent_result.steps:
+        stype = getattr(step, "type", "")
+        if stype == "tool_call":
+            assert isinstance(step, ToolCallStep)
+            steps_out.append(AgentStepOut(
+                type="tool_call",
+                tool=step.tool,
+                args=step.args,
+                result=step.result,
+                duration_ms=step.duration_ms,
+            ))
+        elif stype == "error":
+            assert isinstance(step, ErrorStep)
+            steps_out.append(AgentStepOut(
+                type="error",
+                tool=step.tool,
+                args=step.args,
+                error=step.error,
+                error_kind=step.error_kind,
+            ))
+        elif stype == "final_answer":
+            assert isinstance(step, FinalAnswerStep)
+            steps_out.append(AgentStepOut(
+                type="final_answer",
+                answer=step.answer,
+            ))
+
+    return AgentResponse(
+        answer=agent_result.final_answer,
+        steps=steps_out,
+        aborted=agent_result.aborted,
+        abort_reason=agent_result.abort_reason,
+        degraded=agent_result.degraded,
     )
