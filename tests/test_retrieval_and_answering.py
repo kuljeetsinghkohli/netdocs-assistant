@@ -959,7 +959,7 @@ class TestGeminiClientHelpers:
 
         call_count = [0]
 
-        def fake_call(prompt, temp, mtok):
+        def fake_call_with_model(model, prompt, temp, mtok, *, use_thinking=True):
             call_count[0] += 1
             if call_count[0] == 1:
                 # First call: MAX_TOKENS with empty answer
@@ -975,7 +975,7 @@ class TestGeminiClientHelpers:
                 )
 
         client = self._client_obj()
-        client._call = fake_call  # type: ignore[assignment]
+        client._call_with_model = fake_call_with_model  # type: ignore[assignment]
 
         result = client.complete("system prompt", "user question")
         assert result == "The full answer."
@@ -985,14 +985,14 @@ class TestGeminiClientHelpers:
         """After two consecutive empty answers, a RuntimeError must be raised."""
         from netdocs.llm.client import GeminiClient
 
-        def fake_call(prompt, temp, mtok):
+        def fake_call_with_model(model, prompt, temp, mtok, *, use_thinking=True):
             return _FakeResponse(
                 [_FakeCandidate([_FakePart(text=None, thought=False)], "MAX_TOKENS")],
                 _FakeUsage(),
             )
 
         client = self._client_obj()
-        client._call = fake_call  # type: ignore[assignment]
+        client._call_with_model = fake_call_with_model  # type: ignore[assignment]
 
         with pytest.raises(RuntimeError, match="empty answer after retry"):
             client.complete("sys", "user")
@@ -1001,7 +1001,7 @@ class TestGeminiClientHelpers:
         """Thought parts must never appear in the returned answer."""
         from netdocs.llm.client import GeminiClient
 
-        def fake_call(prompt, temp, mtok):
+        def fake_call_with_model(model, prompt, temp, mtok, *, use_thinking=True):
             parts = [
                 _FakePart("Wait! Could I answer with the specific step present, "
                            "or is it mandatory to", thought=True),
@@ -1013,7 +1013,7 @@ class TestGeminiClientHelpers:
             )
 
         client = self._client_obj()
-        client._call = fake_call  # type: ignore[assignment]
+        client._call_with_model = fake_call_with_model  # type: ignore[assignment]
 
         result = client.complete("sys", "user")
         assert "Wait" not in result

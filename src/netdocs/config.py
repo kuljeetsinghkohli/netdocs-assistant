@@ -85,6 +85,18 @@ class Settings(BaseSettings):
             "Set to a non-thinking model to avoid thought-token leakage."
         ),
     )
+    # Ordered fallback chain tried when a model hits daily quota (429), is
+    # retired for new users (404), or rejects thinking_config (400).
+    gemini_model_fallbacks: str = Field(
+        default="gemini-3.6-flash,gemini-3-flash",
+        alias="GEMINI_MODEL_FALLBACKS",
+        description=(
+            "Comma-separated ordered list of Gemini model IDs to try when the "
+            "primary model fails with a daily quota (429), a retired-model 404, "
+            "or an INVALID_ARGUMENT 400.  The primary model (GEMINI_MODEL) is "
+            "always tried first and is NOT repeated here."
+        ),
+    )
     llm_temperature: float = Field(
         default=0.0,
         description="Sampling temperature (0 = deterministic).",

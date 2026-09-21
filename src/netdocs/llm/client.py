@@ -150,6 +150,58 @@ _GEMINI_THINKING_BUDGET = 0          # 0 = disabled / minimal
 _GEMINI_DEFAULT_MAX_OUTPUT = 4096    # raised from 1024 to avoid truncation
 _GEMINI_RETRY_MAX_OUTPUT = 8192      # retry limit when first call is truncated
 
+# ---------------------------------------------------------------------------
+# Gemini fallback-chain helpers
+# ---------------------------------------------------------------------------
+
+#: Process-lifetime set of Gemini model IDs that have permanently failed.
+#: Populated by GeminiClient.complete(); avoids re-trying a dead model.
+_failed_gemini_models: set[str] = set()
+
+
+def _gemini_fallback_models() -> list[str]:
+    """Return the ordered fallback model list from settings (deduplicated)."""
+    raw = settings.gemini_model_fallbacks
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Return True for 429 / RESOURCE_EXHAUSTED daily-quota errors.
+
+    Only matches the specific phrases Gemini uses for quota exhaustion.
+    Avoids false positives on generic error messages that mention "quota".
+    """
+    msg = str(exc).lower()
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 429:
+        return True
+    return (
+        "429" in msg
+        or "resource_exhausted" in msg
+        or "quota_exceeded" in msg
+        or "per_day" in msg
+        or "daily limit" in msg
+        or "daily quota" in msg
+    )
+
+
+def _is_model_not_found_error(exc: Exception) -> bool:
+    """Return True for 404 NOT_FOUND (model retired / unavailable)."""
+    msg = str(exc).lower()
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 404:
+        return True
+    return "404" in msg or "not_found" in msg or "not found" in msg
+
+
+def _is_invalid_argument_error(exc: Exception) -> bool:
+    """Return True for 400 INVALID_ARGUMENT (e.g. model rejects thinking_config)."""
+    msg = str(exc).lower()
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 400:
+        return True
+    return "400" in msg or "invalid_argument" in msg
+
 
 class GeminiClient(BaseLLMClient):
     """Google Gemini client using the google-genai SDK.
@@ -225,23 +277,45 @@ class GeminiClient(BaseLLMClient):
     # ------------------------------------------------------------------
 
     def _call(self, prompt: str, temp: float, mtok: int) -> Any:
-        """Single generate_content call; returns the raw response object."""
+        """Single generate_content call using self._model."""
+        return self._call_with_model(self._model, prompt, temp, mtok, use_thinking=True)
+
+    def _call_with_model(
+        self,
+        model: str,
+        prompt: str,
+        temp: float,
+        mtok: int,
+        *,
+        use_thinking: bool = True,
+    ) -> Any:
+        """Single generate_content call for *model*; returns the raw response object.
+
+        Args:
+            model:         Gemini model ID to call.
+            prompt:        Full prompt string.
+            temp:          Sampling temperature.
+            mtok:          Max output tokens.
+            use_thinking:  When False, thinking_config is omitted entirely.
+                           Used on the INVALID_ARGUMENT retry for the same model.
+        """
         from google.genai import types  # type: ignore
 
         # Build ThinkingConfig defensively — field names changed between SDK
         # versions.  v1.x uses ``thinking_budget``; earlier releases used
         # ``budget_tokens``.  We try the current name first and fall back.
         thinking_cfg: Any = None
-        try:
-            # SDK >= 1.x: thinking_budget=0 disables/minimises reasoning.
-            # include_thoughts=False ensures thought parts are not returned.
-            thinking_cfg = types.ThinkingConfig(
-                thinking_budget=_GEMINI_THINKING_BUDGET,
-                include_thoughts=False,
-            )
-        except Exception:
-            # Older SDK or model that doesn't support thinking config — skip.
-            thinking_cfg = None
+        if use_thinking:
+            try:
+                # SDK >= 1.x: thinking_budget=0 disables/minimises reasoning.
+                # include_thoughts=False ensures thought parts are not returned.
+                thinking_cfg = types.ThinkingConfig(
+                    thinking_budget=_GEMINI_THINKING_BUDGET,
+                    include_thoughts=False,
+                )
+            except Exception:
+                # Older SDK or model that doesn't support thinking config — skip.
+                thinking_cfg = None
 
         config_kwargs: dict[str, Any] = dict(
             temperature=temp,
@@ -251,7 +325,7 @@ class GeminiClient(BaseLLMClient):
             config_kwargs["thinking_config"] = thinking_cfg
 
         return self._client.models.generate_content(
-            model=self._model,
+            model=model,
             contents=prompt,
             config=types.GenerateContentConfig(**config_kwargs),
         )
@@ -310,26 +384,27 @@ class GeminiClient(BaseLLMClient):
     # Public interface
     # ------------------------------------------------------------------
 
-    def complete(
+    def _complete_with_model(
         self,
-        system: str,
-        user: str,
+        model: str,
+        prompt: str,
+        temp: float,
+        mtok: int,
         *,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
+        use_thinking: bool = True,
     ) -> str:
-        temp = temperature if temperature is not None else self._temperature
-        mtok = max_tokens if max_tokens is not None else self._max_tokens
+        """Run one generate_content round-trip for *model* and return answer text.
 
-        prompt = f"{system}\n\nUser question: {user}"
-
-        response = self._call(prompt, temp, mtok)
+        Handles the MAX_TOKENS / empty-answer retry internally.
+        Raises the underlying SDK exception unchanged so the caller can classify it.
+        """
+        response = self._call_with_model(model, prompt, temp, mtok, use_thinking=use_thinking)
 
         finish = self._finish_reason(response)
         usage = self._token_usage(response)
         logger.debug(
             "Gemini response. model=%s  finish_reason=%s  tokens=%s",
-            self._model, finish, usage,
+            model, finish, usage,
         )
 
         answer = self._extract_text(response)
@@ -342,7 +417,7 @@ class GeminiClient(BaseLLMClient):
                 "Retrying with max_output_tokens=%d.",
                 finish, usage, retry_mtok,
             )
-            response = self._call(prompt, temp, retry_mtok)
+            response = self._call_with_model(model, prompt, temp, retry_mtok, use_thinking=use_thinking)
             finish = self._finish_reason(response)
             usage = self._token_usage(response)
             logger.debug(
@@ -354,11 +429,96 @@ class GeminiClient(BaseLLMClient):
         if not answer.strip():
             raise RuntimeError(
                 f"Gemini returned an empty answer after retry. "
-                f"model={self._model!r}  finish_reason={finish}  tokens={usage}. "
+                f"model={model!r}  finish_reason={finish}  tokens={usage}. "
                 "Check your GEMINI_MODEL setting and API quota."
             )
 
         return answer
+
+    def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        temp = temperature if temperature is not None else self._temperature
+        mtok = max_tokens if max_tokens is not None else self._max_tokens
+        prompt = f"{system}\n\nUser question: {user}"
+
+        # Build the full ordered candidate list: primary first, then fallbacks.
+        primary = self._model
+        fallbacks = _gemini_fallback_models()
+        # Deduplicate: if primary already appears in fallbacks, skip repeats.
+        seen: set[str] = set()
+        candidates: list[str] = []
+        for m in [primary] + fallbacks:
+            if m not in seen:
+                seen.add(m)
+                candidates.append(m)
+
+        last_exc: Exception | None = None
+        for model in candidates:
+            if model in _failed_gemini_models:
+                logger.debug("Gemini: skipping previously-failed model %r.", model)
+                continue
+            try:
+                answer = self._complete_with_model(model, prompt, temp, mtok)
+                logger.info("Gemini: served by model=%r.", model)
+                return answer
+            except Exception as exc:
+                if _is_invalid_argument_error(exc):
+                    # (c) 400 INVALID_ARGUMENT — retry the SAME model without
+                    # thinking_config before giving up on it.
+                    logger.warning(
+                        "Gemini model %r rejected thinking_config (400 INVALID_ARGUMENT: %s). "
+                        "Retrying once without thinking_config.",
+                        model, exc,
+                    )
+                    try:
+                        answer = self._complete_with_model(
+                            model, prompt, temp, mtok, use_thinking=False
+                        )
+                        logger.info("Gemini: served by model=%r (no thinking_config).", model)
+                        return answer
+                    except Exception as exc2:
+                        logger.warning(
+                            "Gemini model %r also failed without thinking_config (%s). "
+                            "Marking as failed and moving to next model.",
+                            model, exc2,
+                        )
+                        _failed_gemini_models.add(model)
+                        last_exc = exc2
+                elif _is_quota_error(exc):
+                    # (a) daily quota 429 — skip permanently for this process.
+                    logger.warning(
+                        "Gemini model %r hit daily quota (429: %s). "
+                        "Skipping for the rest of this process.",
+                        model, exc,
+                    )
+                    _failed_gemini_models.add(model)
+                    last_exc = exc
+                elif _is_model_not_found_error(exc):
+                    # (b) 404 NOT_FOUND — model retired / unavailable.
+                    logger.warning(
+                        "Gemini model %r returned 404 NOT_FOUND (%s). "
+                        "Skipping for the rest of this process.",
+                        model, exc,
+                    )
+                    _failed_gemini_models.add(model)
+                    last_exc = exc
+                else:
+                    # Any other error is not a fallback trigger — re-raise.
+                    raise
+
+        # All candidates failed — propagate to the RetryingLLMClient which
+        # will fall back to extractive (degraded) mode.  Never return a 500.
+        raise RuntimeError(
+            f"All Gemini models in the fallback chain failed. "
+            f"Last error: {last_exc}. "
+            "Falling back to extractive provider."
+        ) from last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +845,7 @@ def get_llm_client() -> BaseLLMClient:
 
 
 def reset_llm_client() -> None:
-    """Clear the singleton — useful in tests to swap providers between cases."""
+    """Clear the singleton and the failed-model set — useful in tests."""
     global _llm_instance
     _llm_instance = None
+    _failed_gemini_models.clear()
