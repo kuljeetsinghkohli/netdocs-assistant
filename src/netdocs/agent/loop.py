@@ -44,6 +44,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from dataclasses import dataclass, field
 from typing import Any, Callable, Union
 
+from netdocs.llm.client import DEGRADED_PREFIX, ExtractiveClient
+
 from netdocs.agent.prompts import (
     DECISION_SYSTEM,
     DECISION_USER,
@@ -56,6 +58,22 @@ from netdocs.agent.prompts import (
 from netdocs.agent.tools import TOOL_REGISTRY, ToolSpec
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# LLM error helpers (used to classify upstream provider failures)
+# ---------------------------------------------------------------------------
+
+def _is_llm_quota_or_rate_error(exc: Exception) -> bool:
+    """Return True if *exc* looks like a 429, 503, quota, or rate-limit error."""
+    from netdocs.llm.client import _is_retryable_error, _is_daily_quota_error  # noqa: PLC0415
+    return _is_retryable_error(exc) or _is_daily_quota_error(exc)
+
+
+_DEGRADED_NOTE = (
+    "⚠️ The LLM provider is rate-limited or quota-exhausted; "
+    "showing a simplified answer based on available documentation."
+)
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -204,6 +222,7 @@ class AgentLoop:
         steps: list[Step] = []
         seen_calls: set[tuple[str, str]] = set()  # (tool, args_json) dedup guard
         result = AgentResult()
+        _llm_failed = False  # set True when LLM raises quota/rate error
 
         tool_desc = format_tool_descriptions(self._tools)
 
@@ -222,10 +241,24 @@ class AgentLoop:
             system = DECISION_SYSTEM.format(tool_descriptions=tool_desc)
             user = DECISION_USER.format(question=question, history=history_text)
 
-            raw = self._llm.complete(system=system, user=user)
+            try:
+                raw = self._llm.complete(system=system, user=user)
+            except Exception as exc:
+                if _is_llm_quota_or_rate_error(exc):
+                    logger.error(
+                        "AgentLoop: LLM unavailable (%s). "
+                        "Falling back to heuristic routing + extractive answer.",
+                        exc,
+                    )
+                    result.degraded = True
+                    _llm_failed = True
+                    # Use heuristic routing to attempt at most one tool call,
+                    # then break out and synthesise an extractive answer.
+                    raw = _heuristic_fallback_action(question, steps, self._tools)
+                else:
+                    raise
 
             # Detect degraded response (extractive fallback after 503 retry)
-            from netdocs.llm.client import DEGRADED_PREFIX
             if raw.startswith(DEGRADED_PREFIX):
                 result.degraded = True
                 raw = raw[len(DEGRADED_PREFIX):]
@@ -335,6 +368,11 @@ class AgentLoop:
                 steps.append(err)
                 _log_tool_call(tool_name, tool_args, None, error=str(exc))
 
+            # If the LLM is unavailable, stop after the single heuristic tool call
+            # and let the synthesis step produce an extractive answer.
+            if _llm_failed:
+                break
+
         # If we broke out of the loop without a final_answer, synthesise one
         if not result.final_answer and not result.aborted:
             result.final_answer = self._synthesise(question, steps)
@@ -346,6 +384,10 @@ class AgentLoop:
                 "Insufficient information to answer the question."
             )
 
+        # Prepend the rate-limit note when degraded and it isn't already present
+        if result.degraded and result.final_answer and _DEGRADED_NOTE not in result.final_answer:
+            result.final_answer = f"{_DEGRADED_NOTE}\n\n{result.final_answer}"
+
         result.steps = steps
         return result
 
@@ -354,7 +396,12 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def _synthesise(self, question: str, steps: list[Step]) -> str:
-        """Call the LLM to synthesise tool results into a final answer."""
+        """Call the LLM to synthesise tool results into a final answer.
+
+        Falls back to :class:`~netdocs.llm.client.ExtractiveClient` when the
+        LLM raises a quota / rate-limit error so that a non-empty answer is
+        always returned.
+        """
         tool_results_text = format_tool_results([_step_to_dict(s) for s in steps])
         system = SYNTHESIS_SYSTEM
         user = SYNTHESIS_USER.format(
@@ -363,12 +410,23 @@ class AgentLoop:
         )
         try:
             raw = self._llm.complete(system=system, user=user)
-            from netdocs.llm.client import DEGRADED_PREFIX
             if raw.startswith(DEGRADED_PREFIX):
                 raw = raw[len(DEGRADED_PREFIX):]
             return raw.strip()
         except Exception as exc:
-            logger.error("AgentLoop._synthesise failed: %s", exc)
+            if _is_llm_quota_or_rate_error(exc):
+                logger.error(
+                    "AgentLoop._synthesise: LLM unavailable (%s). "
+                    "Using extractive fallback for synthesis.",
+                    exc,
+                )
+                try:
+                    raw = ExtractiveClient().complete(system=system, user=user)
+                    return raw.strip()
+                except Exception:
+                    pass
+            else:
+                logger.error("AgentLoop._synthesise failed: %s", exc)
             return ""
 
 
@@ -413,6 +471,25 @@ def run_agent(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _heuristic_fallback_action(
+    question: str,
+    steps: list[Step],
+    tools: dict[str, ToolSpec],
+) -> str:
+    """Return a JSON-encoded action string using keyword heuristics.
+
+    Called when the LLM is unavailable (quota / rate-limit).  Re-uses the same
+    heuristic routing logic already present in :func:`_parse_llm_action` but
+    skips the LLM-JSON path and goes straight to heuristic matching.  When no
+    heuristic matches, returns a ``final_answer`` action with the extractive
+    placeholder so the loop terminates gracefully.
+    """
+    action = _parse_llm_action("", question, tools)
+    if action is None:
+        action = {"action": "final_answer", "answer": ""}
+    return json.dumps(action)
+
 
 def _run_tool_with_timeout(spec: ToolSpec, args: dict[str, Any]) -> Any:
     """Execute *spec.fn(args)* in a thread, raising :exc:`ToolTimeoutError` on timeout."""

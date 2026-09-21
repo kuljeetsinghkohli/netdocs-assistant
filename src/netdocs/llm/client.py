@@ -472,6 +472,29 @@ _RETRY_BASE_DELAY: float = 1.0
 DEGRADED_PREFIX = "[DEGRADED] "
 
 
+#: Substrings that indicate a per-day (non-transient) quota exhaustion.
+#: These must NOT be retried — fall back immediately.
+_DAILY_QUOTA_PHRASES: tuple[str, ...] = (
+    "resource_exhausted",
+    "daily",
+    "per_day",
+    "quota_exceeded",
+    "daily limit",
+    "daily quota",
+)
+
+
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """Return True if *exc* signals a non-transient daily quota exhaustion.
+
+    Gemini returns gRPC status ``RESOURCE_EXHAUSTED`` with quota IDs that
+    contain "per_day" or "daily".  We detect this from the string
+    representation so the retry loop can skip backoff and degrade immediately.
+    """
+    msg = str(exc).lower()
+    return any(phrase in msg for phrase in _DAILY_QUOTA_PHRASES)
+
+
 def _is_retryable_error(exc: Exception) -> bool:
     """Return True if *exc* looks like a 429 or 503 HTTP error."""
     msg = str(exc).lower()
@@ -531,6 +554,17 @@ class RetryingLLMClient(BaseLLMClient):
             except Exception as exc:
                 if not _is_retryable_error(exc):
                     raise
+                # Daily quota errors must not be retried — degrade immediately.
+                if _is_daily_quota_error(exc):
+                    logger.error(
+                        "RetryingLLMClient: daily quota exhausted (%s). "
+                        "Falling back to extractive provider immediately (degraded mode).",
+                        exc,
+                    )
+                    result = self._fallback.complete(
+                        system, user, temperature=temperature, max_tokens=max_tokens
+                    )
+                    return DEGRADED_PREFIX + result
                 last_exc = exc
                 # Only sleep if there is a subsequent attempt to make
                 if attempt + 1 < self._max_attempts:

@@ -821,3 +821,223 @@ class TestRetryingLLMClient:
         assert result.degraded is True
         # The answer should be the content, not the prefix
         assert "DEGRADED" not in result.final_answer
+
+
+# ---------------------------------------------------------------------------
+# AgentLoop — LLM quota / rate-limit degradation
+# ---------------------------------------------------------------------------
+
+def _make_quota_error(message: str = "429 Too Many Requests — rate limit exceeded") -> Exception:
+    """Return a retryable HTTP error mimicking a Gemini/OpenAI 429."""
+    err = RuntimeError(message)
+    err.status_code = 429  # type: ignore[attr-defined]
+    return err
+
+
+def _make_daily_quota_error() -> Exception:
+    """Return an error mimicking Gemini RESOURCE_EXHAUSTED per-day quota."""
+    return RuntimeError(
+        "429 RESOURCE_EXHAUSTED: You exceeded your current quota, daily per_day limit reached."
+    )
+
+
+class TestAgentLoopLLMDegradation:
+    """AgentLoop must degrade gracefully when the LLM raises quota/rate errors."""
+
+    def _minimal_registry_with_neighbor(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        """Return a registry with a single check_neighbor_state stub."""
+        _patch_paths(monkeypatch, configs_dir, mock_inventory, tickets_dir)
+        from netdocs.agent.tools import ToolSpec
+
+        def _mock_neighbor(args: dict) -> dict:
+            return {"device": args.get("device", "TEST"), "neighbors": []}
+
+        return {
+            "check_neighbor_state": ToolSpec(
+                name="check_neighbor_state",
+                description="check BGP neighbor state",
+                fn=_mock_neighbor,
+                timeout_seconds=5.0,
+            ),
+        }
+
+    def test_429_returns_degraded_true(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        """When the LLM raises a 429, the loop returns degraded=True (not an exception)."""
+        from netdocs.llm.client import BaseLLMClient
+        from netdocs.agent.loop import AgentLoop
+
+        registry = self._minimal_registry_with_neighbor(
+            monkeypatch, configs_dir, mock_inventory, tickets_dir
+        )
+
+        class _RateLimitedLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise _make_quota_error()
+
+        loop = AgentLoop(
+            _RateLimitedLLM(),
+            tool_registry=registry,
+            max_steps=5,
+            require_approval=False,
+        )
+        result = loop.run("Is the BGP session on LON-DC01-RTR01 up?")
+
+        assert result.degraded is True
+
+    def test_429_answer_is_non_empty(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        """The degraded answer must contain a non-empty explanation."""
+        from netdocs.llm.client import BaseLLMClient
+        from netdocs.agent.loop import AgentLoop
+
+        registry = self._minimal_registry_with_neighbor(
+            monkeypatch, configs_dir, mock_inventory, tickets_dir
+        )
+
+        class _RateLimitedLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise _make_quota_error()
+
+        loop = AgentLoop(
+            _RateLimitedLLM(),
+            tool_registry=registry,
+            max_steps=5,
+            require_approval=False,
+        )
+        result = loop.run("Is the BGP session on LON-DC01-RTR01 up?")
+
+        assert result.final_answer.strip() != ""
+
+    def test_429_tool_calls_appear_in_trace(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        """Tool calls executed before/during degradation must still appear in steps."""
+        from netdocs.llm.client import BaseLLMClient
+        from netdocs.agent.loop import AgentLoop
+
+        registry = self._minimal_registry_with_neighbor(
+            monkeypatch, configs_dir, mock_inventory, tickets_dir
+        )
+
+        class _RateLimitedLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise _make_quota_error()
+
+        loop = AgentLoop(
+            _RateLimitedLLM(),
+            tool_registry=registry,
+            max_steps=5,
+            require_approval=False,
+        )
+        result = loop.run("Is the BGP session on LON-DC01-RTR01 up?")
+
+        # The heuristic should have routed to check_neighbor_state
+        tool_steps = [s for s in result.steps if getattr(s, "type", "") == "tool_call"]
+        assert tool_steps, "Expected at least one tool_call step in the trace"
+        assert any(s.tool == "check_neighbor_state" for s in tool_steps)
+
+    def test_503_returns_degraded_true(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        """A 503 Service Unavailable error also triggers graceful degradation."""
+        from netdocs.llm.client import BaseLLMClient
+        from netdocs.agent.loop import AgentLoop
+
+        registry = self._minimal_registry_with_neighbor(
+            monkeypatch, configs_dir, mock_inventory, tickets_dir
+        )
+
+        class _ServiceUnavailableLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                err = RuntimeError("503 Service Unavailable")
+                err.status_code = 503  # type: ignore[attr-defined]
+                raise err
+
+        loop = AgentLoop(
+            _ServiceUnavailableLLM(),
+            tool_registry=registry,
+            max_steps=5,
+            require_approval=False,
+        )
+        result = loop.run("Is the BGP session on LON-DC01-RTR01 up?")
+
+        assert result.degraded is True
+
+    def test_non_quota_exception_propagates(self):
+        """A non-retryable exception (e.g. ValueError) must NOT be swallowed."""
+        from netdocs.llm.client import BaseLLMClient
+        from netdocs.agent.loop import AgentLoop
+
+        class _BrokenLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise ValueError("Invalid model configuration")
+
+        loop = AgentLoop(_BrokenLLM(), max_steps=3, require_approval=False)
+        with pytest.raises(ValueError, match="Invalid model configuration"):
+            loop.run("any question")
+
+    def test_degraded_note_in_answer(self, monkeypatch, configs_dir, mock_inventory, tickets_dir):
+        """The final answer must contain the user-facing rate-limit note."""
+        from netdocs.llm.client import BaseLLMClient
+        from netdocs.agent.loop import AgentLoop, _DEGRADED_NOTE
+
+        registry = self._minimal_registry_with_neighbor(
+            monkeypatch, configs_dir, mock_inventory, tickets_dir
+        )
+
+        class _RateLimitedLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise _make_quota_error()
+
+        loop = AgentLoop(
+            _RateLimitedLLM(),
+            tool_registry=registry,
+            max_steps=5,
+            require_approval=False,
+        )
+        result = loop.run("Is the BGP session on LON-DC01-RTR01 up?")
+
+        assert _DEGRADED_NOTE in result.final_answer
+
+
+# ---------------------------------------------------------------------------
+# RetryingLLMClient — daily quota skips retries
+# ---------------------------------------------------------------------------
+
+class TestDailyQuotaDegradation:
+    def test_daily_quota_falls_back_immediately_without_retry(self):
+        """RESOURCE_EXHAUSTED / per-day quota must NOT be retried; degrade immediately."""
+        from netdocs.llm.client import RetryingLLMClient, BaseLLMClient, DEGRADED_PREFIX
+
+        call_count = 0
+
+        class _DailyQuotaLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                raise _make_daily_quota_error()
+
+        client = RetryingLLMClient(
+            _DailyQuotaLLM(), max_attempts=3, base_delay=0.0, _sleep=lambda _: None
+        )
+        result = client.complete("system prompt", "user text")
+
+        # Must have fallen back to extractive (degraded prefix present)
+        assert result.startswith(DEGRADED_PREFIX)
+        # Must NOT have retried — only one call to the inner LLM
+        assert call_count == 1
+
+    def test_daily_quota_no_sleep_delays(self):
+        """Daily quota fallback must not sleep at all."""
+        from netdocs.llm.client import RetryingLLMClient, BaseLLMClient
+
+        delays: list[float] = []
+
+        class _DailyQuotaLLM(BaseLLMClient):
+            def complete(self, system, user, **kwargs):
+                raise _make_daily_quota_error()
+
+        client = RetryingLLMClient(
+            _DailyQuotaLLM(),
+            max_attempts=3,
+            base_delay=2.0,
+            _sleep=lambda d: delays.append(d),
+        )
+        client.complete("sys", "usr")
+
+        assert delays == [], f"Expected no sleep delays for daily quota, got {delays}"
