@@ -567,3 +567,245 @@ class TestSettings:
 
         s = Settings()
         assert s.retrieval_top_k == 10
+
+# ---------------------------------------------------------------------------
+# Tests: Provider selection (offline — no real LLM calls)
+# ---------------------------------------------------------------------------
+
+class TestProviderSelection:
+    """Verify _resolve_provider() auto-fallback logic."""
+
+    def setup_method(self):
+        from netdocs.llm.client import reset_llm_client
+        reset_llm_client()
+
+    def teardown_method(self):
+        from netdocs.llm.client import reset_llm_client
+        reset_llm_client()
+
+    def test_explicit_extractive_returns_extractive_instance(self, monkeypatch):
+        monkeypatch.setenv("NETDOCS_LLM_PROVIDER", "extractive")
+        from netdocs.config import Settings
+        import netdocs.llm.client as client_mod
+
+        # Force re-read of settings
+        original_settings = client_mod.settings
+        client_mod.settings = Settings()
+        try:
+            from netdocs.llm.client import ExtractiveClient
+            result = client_mod._resolve_provider()
+            assert result == "extractive"
+        finally:
+            client_mod.settings = original_settings
+
+    def test_openai_missing_pkg_and_no_gemini_key_falls_back_to_extractive(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("NETDOCS_LLM_PROVIDER", "openai")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        from netdocs.config import Settings
+        import netdocs.llm.client as client_mod
+        import sys
+
+        original_settings = client_mod.settings
+        s = Settings()
+        # Explicitly clear keys so .env file values don't leak through
+        object.__setattr__(s, "openai_api_key", "")
+        object.__setattr__(s, "gemini_api_key", "")
+        client_mod.settings = s
+
+        # Simulate openai package missing
+        saved = sys.modules.get("openai")
+        sys.modules["openai"] = None  # type: ignore
+        try:
+            result = client_mod._resolve_provider()
+            assert result == "extractive"
+        finally:
+            if saved is None:
+                sys.modules.pop("openai", None)
+            else:
+                sys.modules["openai"] = saved
+            client_mod.settings = original_settings
+
+    def test_openai_missing_pkg_with_gemini_key_falls_back_to_gemini(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("NETDOCS_LLM_PROVIDER", "openai")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
+        from netdocs.config import Settings
+        import netdocs.llm.client as client_mod
+        import sys
+
+        original_settings = client_mod.settings
+        client_mod.settings = Settings()
+
+        # Simulate openai package missing
+        saved = sys.modules.get("openai")
+        sys.modules["openai"] = None  # type: ignore
+        try:
+            result = client_mod._resolve_provider()
+            assert result == "gemini"
+        finally:
+            if saved is None:
+                sys.modules.pop("openai", None)
+            else:
+                sys.modules["openai"] = saved
+            client_mod.settings = original_settings
+
+    def test_explicit_gemini_provider_is_preserved(self, monkeypatch):
+        monkeypatch.setenv("NETDOCS_LLM_PROVIDER", "gemini")
+        from netdocs.config import Settings
+        import netdocs.llm.client as client_mod
+
+        original_settings = client_mod.settings
+        client_mod.settings = Settings()
+        try:
+            result = client_mod._resolve_provider()
+            assert result == "gemini"
+        finally:
+            client_mod.settings = original_settings
+
+    def test_fake_provider_is_preserved(self, monkeypatch):
+        monkeypatch.setenv("NETDOCS_LLM_PROVIDER", "fake")
+        from netdocs.config import Settings
+        import netdocs.llm.client as client_mod
+
+        original_settings = client_mod.settings
+        client_mod.settings = Settings()
+        try:
+            result = client_mod._resolve_provider()
+            assert result == "fake"
+        finally:
+            client_mod.settings = original_settings
+
+    def test_get_llm_client_returns_extractive_when_openai_unavailable(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("NETDOCS_LLM_PROVIDER", "openai")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        from netdocs.config import Settings
+        import netdocs.llm.client as client_mod
+        from netdocs.llm.client import ExtractiveClient
+        import sys
+
+        original_settings = client_mod.settings
+        s = Settings()
+        # Explicitly clear keys so .env file values don't leak through
+        object.__setattr__(s, "openai_api_key", "")
+        object.__setattr__(s, "gemini_api_key", "")
+        client_mod.settings = s
+
+        saved = sys.modules.get("openai")
+        sys.modules["openai"] = None  # type: ignore
+        client_mod._llm_instance = None
+        try:
+            llm = client_mod.get_llm_client()
+            assert isinstance(llm, ExtractiveClient)
+        finally:
+            if saved is None:
+                sys.modules.pop("openai", None)
+            else:
+                sys.modules["openai"] = saved
+            client_mod.settings = original_settings
+            client_mod._llm_instance = None
+
+
+# ---------------------------------------------------------------------------
+# Tests: ExtractiveClient (offline)
+# ---------------------------------------------------------------------------
+
+class TestExtractiveClient:
+    def _client(self):
+        from netdocs.llm.client import ExtractiveClient
+        return ExtractiveClient()
+
+    def _system_with_passages(self, passages: list[tuple[str, str, str, str]]) -> str:
+        """Build a fake system prompt matching _build_context_block format."""
+        from netdocs.llm.generator import _build_context_block
+        chunks = [
+            {
+                "id": doc_id,
+                "text": text,
+                "metadata": {
+                    "doc_type": doc_type,
+                    "section_heading": section,
+                    "source_file": f"data/raw/{doc_type}/{doc_id}.md",
+                },
+            }
+            for doc_id, doc_type, section, text in passages
+        ]
+        from netdocs.llm.generator import _SYSTEM_PROMPT
+        context = _build_context_block(chunks)
+        return _SYSTEM_PROMPT.format(context=context)
+
+    def test_extractive_returns_passage_text(self):
+        client = self._client()
+        system = self._system_with_passages([
+            ("DD-001__000", "design_doc", "BGP Overview",
+             "The BGP hold timer is set to 90 seconds on all peering sessions."),
+        ])
+        answer = client.complete(system, "What is the BGP hold timer?")
+        assert "90 seconds" in answer or "90" in answer
+
+    def test_extractive_appends_doc_citation(self):
+        client = self._client()
+        system = self._system_with_passages([
+            ("DD-001__000", "design_doc", "BGP Overview", "BGP hold timer text."),
+        ])
+        answer = client.complete(system, "BGP timer?")
+        assert "[doc:DD-001__000" in answer
+
+    def test_extractive_multiple_passages(self):
+        client = self._client()
+        system = self._system_with_passages([
+            ("DD-001__000", "design_doc", "BGP Overview", "Hold timer is 90s."),
+            ("RB-002__001", "runbook", "Recovery Steps", "Restart BGP session."),
+        ])
+        answer = client.complete(system, "BGP flap?")
+        assert "[doc:DD-001__000" in answer
+        assert "[doc:RB-002__001" in answer
+
+    def test_extractive_no_passages_returns_refusal(self):
+        client = self._client()
+        answer = client.complete("No context passages here.", "what?")
+        assert "cannot find" in answer.lower()
+
+    def test_extractive_long_passage_truncated(self):
+        client = self._client()
+        long_text = "word " * 200  # 200 words
+        system = self._system_with_passages([
+            ("DD-001__000", "design_doc", "Section", long_text),
+        ])
+        answer = client.complete(system, "question?")
+        word_count = len(answer.split())
+        assert word_count < 200, "Long passages should be truncated"
+
+    def test_extractive_integrates_with_generate_answer(self):
+        """ExtractiveClient plugs into the generator pipeline end-to-end."""
+        from netdocs.llm.generator import generate_answer
+        from netdocs.llm.client import ExtractiveClient
+
+        chunk = {
+            "id": "DD-003__002",
+            "text": "BGP sessions flapped due to keepalive timeout after maintenance.",
+            "metadata": {
+                "doc_type": "ticket",
+                "section_heading": "Incident Root Cause",
+                "source_file": "data/raw/ticket/DD-003__002.md",
+            },
+            "rerank_score": 5.0,
+        }
+        result = generate_answer(
+            "Why did the BGP session flap?",
+            [chunk],
+            ExtractiveClient(),
+            confidence_threshold=0.10,
+        )
+        assert not result.refused
+        assert "keepalive" in result.answer or "BGP" in result.answer
+        assert len(result.citations) >= 1
+        assert result.citations[0].doc_id == "DD-003__002"
+

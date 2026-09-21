@@ -24,6 +24,7 @@ from rich.table import Table
 from netdocs.config import settings
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _configure_logging(level: str) -> None:

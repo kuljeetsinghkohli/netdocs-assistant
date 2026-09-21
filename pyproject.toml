@@ -25,6 +25,9 @@ dependencies = [
 openai = [
     "openai>=1.30.0",
 ]
+gemini = [
+    "google-genai>=0.8.0",
+]
 dev = [
     "pytest>=8.2.0",
     "pytest-cov>=5.0.0",

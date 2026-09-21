@@ -62,11 +62,18 @@ class Settings(BaseSettings):
     # --- LLM --------------------------------------------------------------
     llm_provider: str = Field(
         default="openai",
-        description="LLM provider: 'openai' | 'ollama' | 'fake' (testing only).",
+        description=(
+            "LLM provider: 'openai' | 'ollama' | 'gemini' | 'extractive' | 'fake'. "
+            "When set to 'openai' but the package/key is missing, auto-falls back to "
+            "'gemini' (if GEMINI_API_KEY is set) or 'extractive'."
+        ),
     )
     llm_model: str = Field(
         default="gpt-4o-mini",
-        description="Model name passed to the LLM provider.",
+        description=(
+            "Model name passed to the LLM provider. "
+            "For Gemini use e.g. 'gemini-2.0-flash' or 'gemini-1.5-pro'."
+        ),
     )
     llm_temperature: float = Field(
         default=0.0,
@@ -85,6 +92,12 @@ class Settings(BaseSettings):
         default="",
         alias="OPENAI_API_KEY",
         description="OpenAI API key (required when llm_provider='openai').",
+    )
+    # Read as GEMINI_API_KEY (no NETDOCS_ prefix) via alias
+    gemini_api_key: str = Field(
+        default="",
+        alias="GEMINI_API_KEY",
+        description="Google Gemini API key (required when llm_provider='gemini').",
     )
 
     # --- Retrieval --------------------------------------------------------
