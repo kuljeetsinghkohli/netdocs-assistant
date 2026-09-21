@@ -1,0 +1,44 @@
+TICKET_ID: CRQ-2024-1205
+TITLE: Azure ExpressRoute Circuit Upgrade — 500 Mbps to 1 Gbps
+STATUS: Open
+PRIORITY: High
+RISK_LEVEL: High
+AFFECTED_DEVICE: LON-DC01-RTR01 (ER termination), Equinix LD4 cross-connect
+AFFECTED_SITE: LON-DC01
+CHANGE_DATE: 2024-12-05
+CHANGE_WINDOW: 2024-12-05 01:00 UTC – 2024-12-05 05:00 UTC
+REQUESTED_BY: Alex Mercer
+APPROVED_BY: Tom Bradley
+IMPLEMENTED_BY: TBD (Alex Mercer + Equinix NOC)
+TICKET_TYPE: Major Change
+
+DESCRIPTION:
+Azure ExpressRoute circuit bandwidth will be upgraded from 500 Mbps to 1 Gbps to accommodate growing Azure VNet traffic (currently at 78% utilisation during peak hours). The upgrade requires Equinix to provision a new Fabric connection and Azure to reprovision the ER circuit. Contoso BGP configuration on LON-DC01-RTR01 will remain unchanged — the new circuit uses the same peering IPs.
+
+The ER circuit will have a brief (~5 minute) outage during reprovisioning. During this window, Azure traffic will failover to the SD-WAN Cloud On-Ramp (AZ-WEU-COR) automatically via BGP local preference.
+
+IMPLEMENTATION PLAN:
+1. Pre-change: Confirm AZ-WEU-COR OMP sessions and BGP to Azure are Up (failover path).
+2. Baseline capture: show ip bgp summary, show interface Vlan200 (ER VLAN).
+3. Engage Equinix LD4 NOC to provision new 1G Fabric connection.
+4. Azure: Modify ER circuit bandwidth in Azure Portal (Subscription: contoso-prod-subscription-01 > ExpressRoute Circuits > contoso-er-ld4 > Change bandwidth to 1 Gbps).
+5. Equinix connects new cross-connect — brief outage expected here.
+6. Verify ER physical layer comes back: show interface Vlan200 (up/up).
+7. Verify BGP re-establishes: show ip bgp summary (peer 172.16.10.1 in Established).
+8. Verify Azure prefixes are via ER path (local-pref 180): show ip route 10.102.0.0.
+9. Monitor for 30 minutes.
+
+ROLLBACK PLAN:
+If ER circuit does not come back after Equinix provisioning:
+1. Leave Azure traffic on AZ-WEU-COR SD-WAN cloud on-ramp path.
+2. Engage Equinix emergency escalation: ld4-noc@equinix.com / +1 800 225 5432.
+3. Open Azure support case: Severity A (circuit down).
+4. Reassess and reschedule upgrade.
+
+TEST PLAN:
+- Post-upgrade bandwidth confirmed as 1 Gbps in Azure Portal.
+- ER BGP re-established with correct local-pref (180).
+- Throughput test: iperf3 from LON-DC01 server to Azure VM: target > 900 Mbps.
+- AZ-WEU-COR path no longer carrying traffic (confirms failback to ER).
+
+REFERENCES: DD-006, Equinix Fabric Portal, Azure ExpressRoute documentation

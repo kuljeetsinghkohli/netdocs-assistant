@@ -1,0 +1,54 @@
+TICKET_ID: CRQ-2024-1002
+TITLE: AWS Direct Connect Failover Test — LON-DC01 Primary DX
+STATUS: Closed
+PRIORITY: Medium
+RISK_LEVEL: High
+AFFECTED_DEVICE: LON-DC01-RTR01
+AFFECTED_SITE: LON-DC01
+CHANGE_DATE: 2024-10-02
+CHANGE_WINDOW: 2024-10-02 23:00 UTC – 2024-10-03 01:00 UTC
+REQUESTED_BY: Alex Mercer
+APPROVED_BY: Tom Bradley
+IMPLEMENTED_BY: Alex Mercer
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+Planned failover test to validate that AWS Direct Connect (primary) and SD-WAN Cloud On-Ramp (backup) failover operates correctly for AWS us-east-1 workloads. The test simulates primary DX failure by temporarily shutting the DX Virtual Interface on LON-DC01-RTR01.
+
+Expected: Traffic to AWS prod-vpc-use1 (10.100.0.0/16) reroutes via AWS-USE1-COR (SD-WAN cloud on-ramp) within 5 seconds.
+
+Pre-requisites:
+- AWS-USE1-COR is operational and OMP sessions confirmed Up.
+- AWS Application team (cloud-apps@contoso.internal) notified — non-critical workloads only during test window.
+- Cloud infrastructure team on standby: +1 555 0199.
+
+IMPLEMENTATION PLAN:
+1. Baseline capture: show ip bgp summary, show ip route 10.100.0.0, ping 10.100.0.10 from LON-DC01-RTR01.
+2. Shut DX virtual interface:
+   interface Vlan200
+    shutdown
+3. Wait 10 seconds. Capture:
+   - show ip bgp summary (DX BGP peer should be down)
+   - show ip route 10.100.0.0 (should now show OMP/SD-WAN path via AWS-USE1-COR)
+   - ping 10.100.0.10 from LON-DC01-RTR01 (should still succeed)
+4. Record failover time (from interface shutdown to successful ping).
+5. Restore DX:
+   interface Vlan200
+    no shutdown
+6. Verify DX BGP re-establishes and traffic returns to DX path (local-pref 180 > OMP 120).
+7. Confirm restore in monitoring dashboard.
+
+ROLLBACK PLAN:
+If DX BGP does not re-establish after no shutdown:
+1. Check DX physical layer (Equinix LOC contact: ld4-noc@equinix.com).
+2. Contact AWS Support: Enterprise Support TAM — case number to be opened if needed.
+3. Leave SD-WAN cloud on-ramp as active path until DX is restored.
+
+TEST PLAN:
+- Failover time < 5 seconds: PASS
+- Application reachability maintained throughout failover: PASS
+- Traffic returns to DX path within 60 seconds of restoration: PASS
+
+OUTCOME: Successful. DX failover in 3.2 seconds. SD-WAN cloud on-ramp carried all AWS traffic without packet loss after initial convergence. DX restoration took 45 seconds. All criteria met.
+
+REFERENCES: DD-006, RB-003, AWS Direct Connect runbook (internal Wiki)

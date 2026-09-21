@@ -1,0 +1,54 @@
+TICKET_ID: CRQ-2024-1015
+TITLE: BGP Route Policy Audit and Cleanup — LON-DC01 and NYC-DC01
+STATUS: Closed
+PRIORITY: Low
+RISK_LEVEL: Low
+AFFECTED_DEVICE: LON-DC01-RTR01, NYC-DC01-RTR01
+AFFECTED_SITE: LON-DC01, NYC-DC01
+CHANGE_DATE: 2024-10-15
+CHANGE_WINDOW: 2024-10-15 22:00 UTC – 2024-10-16 00:00 UTC
+REQUESTED_BY: Priya Nair
+APPROVED_BY: Sandra Lin
+IMPLEMENTED_BY: Priya Nair
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+Following the BGP route leak incident in 2024 (INC-2024-0930), a full audit of all BGP route-maps and prefix-lists on LON-DC01-RTR01 and NYC-DC01-RTR01 was scheduled. The audit identified:
+1. Stale prefix-list PL-OLD-EMEA (references decommissioned subnets 10.9.0.0/20 — no longer assigned).
+2. Route-map RM-FROM-BT-IN contained a permit-all fallthrough clause that was overly permissive.
+3. A `permit 20` clause in RM-TO-BT-OUT had no match condition (implicit permit any — this was the root cause of the 2024-0930 route leak).
+
+This change removes stale config and tightens the outbound policy.
+
+IMPLEMENTATION PLAN:
+LON-DC01-RTR01:
+1. Remove stale prefix-list:
+   no ip prefix-list PL-OLD-EMEA
+2. Tighten RM-FROM-BT-IN — remove the final overly permissive permit clause:
+   route-map RM-FROM-BT-IN
+    no permit 9000
+   Add explicit deny:
+   route-map RM-FROM-BT-IN deny 9999
+3. Remove the no-match permit clause from RM-TO-BT-OUT:
+   route-map RM-TO-BT-OUT
+    no permit 20
+4. Soft-reset outbound: clear ip bgp 172.16.0.1 soft out
+5. Verify only expected prefixes are advertised: show ip bgp neighbors 172.16.0.1 advertised-routes | count
+   (expected: 1 — the 10.0.0.0/8 summary)
+
+Repeat equivalent steps on NYC-DC01-RTR01.
+
+ROLLBACK PLAN:
+If any BGP session is disrupted:
+1. Re-add the removed route-map clauses.
+2. Soft reset outbound.
+3. Verify session stability.
+
+TEST PLAN:
+- Confirm advertised-routes count = 1 (10.0.0.0/8 only) on both routers.
+- No BGP session resets during or after change.
+- Monitor for 15 minutes post-change.
+
+OUTCOME: Successful. Stale prefix-lists removed. Route-map tightened. Advertised route count confirmed as 1. No session disruptions.
+
+REFERENCES: INC-2024-0930, DD-003, RB-007

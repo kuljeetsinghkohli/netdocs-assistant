@@ -1,0 +1,48 @@
+TICKET_ID: CRQ-2024-0905
+TITLE: OSPF MD5 Key Rotation — All DC Sites (Quarterly)
+STATUS: Closed
+PRIORITY: Medium
+RISK_LEVEL: Medium
+AFFECTED_DEVICE: LON-DC01-RTR01, LON-DC01-RTR02, NYC-DC01-RTR01, SGP-DC01-RTR01, DXB-DC01-RTR01
+AFFECTED_SITE: All DC Sites
+CHANGE_DATE: 2024-09-05
+CHANGE_WINDOW: 2024-09-05 01:00 UTC – 2024-09-05 04:00 UTC
+REQUESTED_BY: Meera Patel
+APPROVED_BY: Sandra Lin
+IMPLEMENTED_BY: Tom Bradley
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+Quarterly OSPF MD5 authentication key rotation across all data centre routers participating in OSPF Process 1. Keys are rotated per Contoso security policy to limit exposure in the event of a key compromise. New keys are pre-generated and stored in HashiCorp Vault at network/ospf/area0-key (new version committed before change window).
+
+OSPF supports overlapping key IDs — key 2 will be added before key 1 is removed, ensuring no adjacency disruption.
+
+IMPLEMENTATION PLAN:
+On each DC router (in order: LON-DC01-RTR01, LON-DC01-RTR02, NYC, SGP, DXB):
+1. Retrieve new key from Vault: vault kv get network/ospf/area0-key
+2. Add new key ID 2 on all relevant interfaces:
+   interface GigabitEthernet0/0/0
+    ip ospf message-digest-key 2 md5 <new-key>
+3. Wait 2 minutes. Verify adjacency remains in FULL state: show ip ospf neighbor
+4. Remove old key ID 1:
+   interface GigabitEthernet0/0/0
+    no ip ospf message-digest-key 1 md5 <old-key>
+5. Repeat for all OSPF-enabled interfaces on the device.
+6. Move to next device only after current device adjacencies confirmed FULL.
+
+ROLLBACK PLAN:
+If any adjacency drops and does not recover within 3 minutes after key 2 addition:
+1. Re-add key ID 1 with old value.
+2. Remove key ID 2.
+3. Abort rotation for remaining devices.
+4. Reassess and re-schedule.
+
+TEST PLAN:
+After completing all routers:
+- show ip ospf neighbor (all sites — verify FULL state)
+- show ip route ospf (verify routing table unchanged)
+- Ping LON-DC01 → NYC-DC01: ping 10.200.1.2 source 10.200.1.1
+
+OUTCOME: Successful. All adjacencies remained stable. Key rotation completed with zero adjacency resets. New key active on all 5 DC routers.
+
+REFERENCES: DD-004, RB-008, Contoso Security Policy §8.4 (Key Rotation)

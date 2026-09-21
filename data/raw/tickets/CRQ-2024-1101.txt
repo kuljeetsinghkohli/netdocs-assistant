@@ -1,0 +1,52 @@
+TICKET_ID: CRQ-2024-1101
+TITLE: vManage Software Upgrade to 20.12.1
+STATUS: Closed
+PRIORITY: High
+RISK_LEVEL: High
+AFFECTED_DEVICE: vManage-01 (10.200.0.20), vManage-02 (10.200.0.21)
+AFFECTED_SITE: LON-DC01 (management plane)
+CHANGE_DATE: 2024-11-01
+CHANGE_WINDOW: 2024-11-01 00:00 UTC – 2024-11-01 04:00 UTC
+REQUESTED_BY: Alex Mercer
+APPROVED_BY: Sandra Lin
+IMPLEMENTED_BY: Alex Mercer
+TICKET_TYPE: Major Change
+
+DESCRIPTION:
+Upgrade Cisco vManage from version 20.9.3 to 20.12.1 to address 3 critical CVEs (CVE-2024-20356, CVE-2024-20391, CVE-2024-20412) and gain access to new SD-WAN Application Intelligence features. vSmart and vBond remain on 20.9.3 during this change (upgrade to follow in CRQ-2024-1115).
+
+The vManage HA pair will be upgraded sequentially: secondary first, then primary. During secondary upgrade, primary continues to serve all management traffic. During primary upgrade, secondary (now on 20.12.1) takes over.
+
+Risk: The upgrade window is 4 hours. If the upgrade fails, rollback is time-consuming (snapshot restore) and may extend the maintenance window.
+
+IMPLEMENTATION PLAN:
+1. Pre-upgrade: Take VMware snapshot of both vManage VMs.
+2. Download software image: cisco-vmanage-20.12.1.iso to vManage staging directory.
+3. Upgrade vManage-02 (secondary):
+   - Administration > Software Upgrade > Upload Image
+   - Select vManage-02 > Upgrade > Version 20.12.1
+   - Monitor upgrade progress (~45 min)
+4. Verify vManage-02 on 20.12.1: show version
+5. Switchover: promote vManage-02 to primary (Configuration > Cluster Management > Set Active)
+6. Upgrade vManage-01 (now secondary) to 20.12.1
+7. Verify both vManage nodes on 20.12.1
+8. Verify all vEdge and controller connections in vManage dashboard
+9. Delete VMware snapshots after 48-hour stabilisation period.
+
+ROLLBACK PLAN:
+If upgrade fails at any stage:
+1. Revert affected VM to snapshot.
+2. Confirm vManage comes back on previous version.
+3. Verify all device connections are re-established.
+4. Open TAC case for failed upgrade analysis.
+
+TEST PLAN:
+- Both vManage nodes on 20.12.1
+- All vEdge control connections showing green in vManage
+- vSmart and vBond connections intact
+- Push a test config change to a non-production device (LON-BR13-VE01)
+- CVE remediation: verify patch notes confirm CVEs resolved
+
+OUTCOME: Successful. Both nodes upgraded to 20.12.1 within 3 hours 45 minutes. All 47 branch sites and 4 hub connections remain green. CVEs confirmed patched per Cisco Security Advisory.
+
+REFERENCES: Cisco Security Advisory cisco-sa-sdwan-vmanage-2024-sept, DD-001

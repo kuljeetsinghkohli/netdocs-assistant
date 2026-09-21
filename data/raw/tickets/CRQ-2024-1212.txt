@@ -1,0 +1,37 @@
+TICKET_ID: CRQ-2024-1212
+TITLE: BFD Timer Adjustment — APAC Hub Tunnels (False Positive Flapping)
+STATUS: Closed
+PRIORITY: Medium
+RISK_LEVEL: Low
+AFFECTED_DEVICE: SGP-DC01-RTR01, SGP branch vEdge fleet
+AFFECTED_SITE: SGP-DC01, SGP-BR01 through SGP-BR04
+CHANGE_DATE: 2024-12-12
+CHANGE_WINDOW: 2024-12-12 16:00 UTC – 2024-12-12 18:00 UTC
+REQUESTED_BY: Sandra Lin
+APPROVED_BY: Alex Mercer
+IMPLEMENTED_BY: Sandra Lin
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+NOC has raised 14 tunnel-down alerts for SGP-BR sites over the past 3 weeks, all on the MPLS transport. Investigation (INC-2024-1198) found that BFD sessions on SGP MPLS links are using 200 ms / multiplier 3 (600 ms detection) which is too aggressive for the SGP MPLS provider (SingTel) circuit quality. The SingTel circuit shows up to 450 ms jitter under congestion, causing spurious BFD failures.
+
+This change increases BFD interval to 500 ms / multiplier 3 (1500 ms detection) on SGP MPLS tunnels. This is still below the 2-second threshold for sub-2-second failover but significantly reduces false positives.
+
+IMPLEMENTATION PLAN:
+Via vManage template update:
+1. Navigate to Configuration > Templates > Feature Templates > VEDGE-TRANSPORT-MPLS-SGP.
+2. Edit tunnel-interface BFD interval: 500 (was 200), min_rx: 500 (was 200), multiplier: 3 (unchanged).
+3. Push template to SGP-DC01-RTR01 and all SGP branch vEdges.
+4. Monitor in vManage Tunnel Statistics for 24 hours.
+
+ROLLBACK PLAN:
+Revert feature template to previous values (200/200/3) and push.
+
+TEST PLAN:
+- No BFD-related tunnel down alerts in the 48 hours following change.
+- Tunnel statistics show stable BFD sessions on MPLS for all SGP sites.
+- If a genuine MPLS outage occurs, failover to biz-internet should still occur within 2 seconds.
+
+OUTCOME: Successful. Zero BFD false-positive alerts in the 7 days following change. MPLS tunnel stability confirmed. One genuine MPLS mini-outage (1.2 s) at SGP-BR03 on 2024-12-14 triggered correct failover to biz-internet within 1.8 s.
+
+REFERENCES: INC-2024-1198, DD-001 §6.2, RB-003

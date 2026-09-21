@@ -1,0 +1,40 @@
+TICKET_ID: CRQ-2025-0122
+TITLE: BGP Additional Paths (ADD-PATH) — Enable for iBGP Hub Mesh
+STATUS: Planned
+PRIORITY: Low
+RISK_LEVEL: Medium
+AFFECTED_DEVICE: LON-DC01-RTR01, NYC-DC01-RTR01, SGP-DC01-RTR01, DXB-DC01-RTR01
+AFFECTED_SITE: All DC Sites
+CHANGE_DATE: 2025-01-22
+CHANGE_WINDOW: 2025-01-22 02:00 UTC – 2025-01-22 04:00 UTC
+REQUESTED_BY: Priya Nair
+APPROVED_BY: Sandra Lin
+IMPLEMENTED_BY: Priya Nair (planned)
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+Currently, iBGP between hub routers selects a single best path for each prefix and only advertises that path to iBGP peers. This means that if the best-path hub is unreachable, convergence requires BGP to select a new best path, which can take 3–5 seconds even with BFD. Enabling BGP Additional Paths (RFC 7911) allows each hub to advertise up to 4 paths for each prefix to iBGP peers, enabling immediate path selection on failure without waiting for BGP reconvergence.
+
+Expected benefit: BGP convergence on inter-DC path failure improves from ~3 seconds to sub-second.
+
+IMPLEMENTATION PLAN:
+On each hub router (all 4 simultaneously — iBGP mesh, all must support ADD-PATH):
+   router bgp 65001
+    bgp additional-paths send receive
+    address-family ipv4 unicast
+     bgp additional-paths select backup
+     neighbor IBGP-HUBS additional-paths send receive
+    exit-address-family
+After configuration:
+   clear ip bgp IBGP-HUBS soft
+Verify:
+   show ip bgp 10.10.0.0 255.255.0.0
+
+ROLLBACK PLAN:
+Remove additional-paths configuration and soft-reset iBGP.
+
+TEST PLAN:
+- show ip bgp: multiple paths visible for key prefixes (LON DC prefix should show 3 alternatives from other hubs).
+- Shutdown iBGP link between LON and NYC: traffic should not black-hole — measure convergence time.
+
+REFERENCES: DD-003, RFC 7911

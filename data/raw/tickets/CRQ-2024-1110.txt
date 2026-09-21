@@ -1,0 +1,57 @@
+TICKET_ID: CRQ-2024-1110
+TITLE: OSPF Area 3 Conversion to NSSA — DXB-DC01
+STATUS: Closed
+PRIORITY: Low
+RISK_LEVEL: Medium
+AFFECTED_DEVICE: DXB-DC01-RTR01, LON-DC01-RTR01 (ABR)
+AFFECTED_SITE: DXB-DC01
+CHANGE_DATE: 2024-11-10
+CHANGE_WINDOW: 2024-11-10 20:00 UTC – 2024-11-10 22:00 UTC
+REQUESTED_BY: Tom Bradley
+APPROVED_BY: Priya Nair
+IMPLEMENTED_BY: Tom Bradley
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+DXB-DC01 (OSPF Area 3, currently Stub) needs to redistribute a locally-originated static route (10.13.200.0/24 — a new OT/IoT network segment) into OSPF. Stub areas do not permit Type 5 (External) LSAs or ASBRs. To support this redistribution while maintaining protection from external LSAs, Area 3 will be converted from Stub to NSSA (Not-So-Stubby Area). The NSSA generates a Type 7 LSA locally which is translated to Type 5 at the ABR (LON-DC01-RTR01).
+
+IMPLEMENTATION PLAN:
+1. On DXB-DC01-RTR01:
+   router ospf 1
+    no area 3 stub
+    area 3 nssa
+   verify: show ip ospf | include Area 3
+2. On LON-DC01-RTR01 (ABR):
+   router ospf 1
+    no area 3 stub
+    area 3 nssa
+   (ABR must match area type)
+3. Wait for adjacency to re-establish (brief reset expected — ~5 seconds):
+   show ip ospf neighbor
+4. On DXB-DC01-RTR01, add redistribution:
+   router ospf 1
+    redistribute static subnets route-map RM-STATIC-TO-OSPF
+   route-map RM-STATIC-TO-OSPF permit 10
+    match ip address prefix-list PL-IOT-STATIC
+   ip prefix-list PL-IOT-STATIC seq 10 permit 10.13.200.0/24
+5. Verify Type 7 LSA generated on DXB-DC01-RTR01:
+   show ip ospf database nssa-external
+6. Verify Type 5 LSA visible on LON-DC01-RTR01 (ABR translation):
+   show ip ospf database external | include 10.13.200
+
+ROLLBACK PLAN:
+1. Remove redistribution from DXB-DC01-RTR01.
+2. Revert both routers back to Stub area:
+   router ospf 1
+    no area 3 nssa
+    area 3 stub
+3. Confirm adjacency re-establishes. Note: the static route will not be reachable remotely until rollback is reverted.
+
+TEST PLAN:
+- show ip ospf neighbor: DXB-DC01 adjacency in FULL state post-change.
+- show ip route 10.13.200.0 on LON-DC01-RTR01: should show O E2 via DXB.
+- ping 10.13.200.1 from LON-DC01 server (if OT device is online).
+
+OUTCOME: Successful. NSSA conversion completed without extended adjacency outage. Type 7→5 translation confirmed. 10.13.200.0/24 reachable from LON-DC01 within 30 seconds of redistribution.
+
+REFERENCES: DD-004, RB-008, RFC 3101 (OSPF NSSA)

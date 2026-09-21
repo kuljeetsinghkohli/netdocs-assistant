@@ -1,0 +1,47 @@
+TICKET_ID: CRQ-2025-0108
+TITLE: New VPN Segment — OT/IoT Network Expansion to NYC and SGP
+STATUS: In-Progress
+PRIORITY: High
+RISK_LEVEL: High
+AFFECTED_DEVICE: NYC-DC01-RTR01, SGP-DC01-RTR01, vManage (policy)
+AFFECTED_SITE: NYC-DC01, SGP-DC01
+CHANGE_DATE: 2025-01-08
+CHANGE_WINDOW: 2025-01-08 23:00 UTC – 2025-01-09 03:00 UTC
+REQUESTED_BY: Tom Bradley
+APPROVED_BY: Alex Mercer
+IMPLEMENTED_BY: Tom Bradley (in progress)
+TICKET_TYPE: Major Change
+
+DESCRIPTION:
+OT/IoT VPN (VPN 3, 192.168.100.0/22) is currently only present at LON-DC01 and EMEA branches. The Contoso OT team is deploying new IoT sensors at NYC and SGP manufacturing facilities, requiring VPN 3 to be extended to NYC-DC01 and SGP-DC01 sites.
+
+Changes required:
+1. Create VPN 3 routing instance on NYC-DC01-RTR01 and SGP-DC01-RTR01.
+2. Update vManage device templates to add VPN 3 interface on APAC/Americas vEdges.
+3. Update centralised policy to permit OT/IoT traffic within VPN 3 (no internet, no cross-VPN).
+4. Add OT subnet ranges to IPAM: NYC OT = 192.168.101.0/24, SGP OT = 192.168.102.0/24.
+
+Risk assessment: High — modifying VPN segmentation on hub routers. Error could cause cross-VPN leakage (OT to Corporate). All changes must be validated in test environment first.
+
+IMPLEMENTATION PLAN:
+[In progress — see sub-task tracking in ITSM]
+1. Test in lab environment (lab vEdge at LON-DC01 lab rack) — COMPLETE.
+2. Apply to NYC-DC01-RTR01 in change window.
+3. Apply to SGP-DC01-RTR01.
+4. Push updated vManage policy.
+5. Validate OT connectivity (IoT sensor ping test from OT VLAN).
+6. Validate no cross-VPN leakage (ping Corporate VPN1 from OT VPN3 — must fail).
+
+ROLLBACK PLAN:
+1. Remove VPN 3 interface from NYC and SGP DC routers.
+2. Revert vManage templates to previous version.
+3. Remove IPAM entries for NYC/SGP OT subnets.
+NOTE: Rollback will leave IoT devices offline — coordinate with OT team before execution.
+
+TEST PLAN:
+- OT subnet 192.168.101.0/24 reachable from NYC OT sensors.
+- Ping from 192.168.101.x to 10.10.0.1 (Corporate) FAILS.
+- Ping from 192.168.101.x to 192.168.100.1 (LON OT hub) SUCCEEDS.
+- Zabbix monitoring: new OT hosts added and showing green.
+
+REFERENCES: DD-001 §5 VPN Segmentation, Contoso OT Network Policy v2.1

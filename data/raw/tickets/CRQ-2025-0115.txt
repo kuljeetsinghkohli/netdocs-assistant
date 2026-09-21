@@ -1,0 +1,45 @@
+TICKET_ID: CRQ-2025-0115
+TITLE: vSmart and vBond Software Upgrade to 20.12.1
+STATUS: Planned
+PRIORITY: High
+RISK_LEVEL: High
+AFFECTED_DEVICE: vSmart-01 (10.200.0.10), vSmart-02 (10.200.0.11), vBond-01 (10.200.0.30), vBond-02 (10.200.0.31)
+AFFECTED_SITE: LON-DC01 (management plane)
+CHANGE_DATE: 2025-01-15
+CHANGE_WINDOW: 2025-01-15 00:00 UTC – 2025-01-15 04:00 UTC
+REQUESTED_BY: Alex Mercer
+APPROVED_BY: Sandra Lin
+IMPLEMENTED_BY: Alex Mercer (planned)
+TICKET_TYPE: Major Change
+
+DESCRIPTION:
+vManage was upgraded to 20.12.1 in CRQ-2024-1101. This change upgrades vSmart and vBond to the same version (20.12.1) to restore component version parity. Mixed-version operation (vManage 20.12.1, vSmart/vBond 20.9.3) is supported per Cisco compatibility matrix but is not the target state.
+
+During vSmart upgrade: OMP sessions will be briefly disrupted per controller (30–60 seconds). vEdge devices retain cached OMP policy and continue forwarding during this window. BFD-based failover and data plane remain unaffected.
+
+During vBond upgrade: New ZTP registrations will be unavailable. Existing devices are not affected.
+
+IMPLEMENTATION PLAN:
+1. Pre-change: Take VMware snapshots of all 4 controller VMs.
+2. Upgrade vBond-02 (secondary): Administration > Software Upgrade.
+3. Verify vBond-02 on 20.12.1; vBond-01 still on 20.9.3 — ZTP still functional.
+4. Upgrade vBond-01.
+5. Upgrade vSmart-02 (secondary):
+   - Monitor OMP session reconvergence after upgrade restart (~60 s).
+   - Confirm all vEdges reconnect to vSmart-01.
+6. Upgrade vSmart-01.
+7. Verify both vSmarts on 20.12.1 and all vEdge OMP sessions reconnected.
+8. Delete snapshots after 48-hour stabilisation.
+
+ROLLBACK PLAN:
+1. Revert VM snapshot for any failed controller.
+2. Confirm OMP sessions re-establish with previous version controller.
+3. Open TAC case if upgrade repeatedly fails.
+
+TEST PLAN:
+- All 4 controllers on 20.12.1.
+- All vEdge devices have OMP sessions to both vSmarts (Up).
+- vManage shows version parity across all controllers.
+- ZTP test: stage a new test device through vBond to confirm ZTP still works.
+
+REFERENCES: CRQ-2024-1101, DD-001, Cisco vSmart Upgrade Guide

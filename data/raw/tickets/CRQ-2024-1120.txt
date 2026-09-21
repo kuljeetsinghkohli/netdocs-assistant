@@ -1,0 +1,39 @@
+TICKET_ID: CRQ-2024-1120
+TITLE: Zscaler ZIA Policy Update — Add O365 Bypass for APAC Branches
+STATUS: Closed
+PRIORITY: Medium
+RISK_LEVEL: Low
+AFFECTED_DEVICE: vManage (SGP branch vEdge policies)
+AFFECTED_SITE: SGP-BR01, SGP-BR02, SGP-BR03, SGP-BR04
+CHANGE_DATE: 2024-11-20
+CHANGE_WINDOW: 2024-11-20 14:00 UTC – 2024-11-20 16:00 UTC
+REQUESTED_BY: Meera Patel
+APPROVED_BY: Alex Mercer
+IMPLEMENTED_BY: Meera Patel
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+APAC branch users are experiencing high latency (>300 ms) for Microsoft Teams calls. Investigation shows that Teams media traffic is currently flowing via Zscaler inspection at the Singapore ZIA PoP, adding 120 ms of processing overhead. Per Microsoft's connectivity guidance, Teams 'Optimize' category traffic should bypass cloud proxy inspection and be routed directly to Microsoft's network.
+
+This change updates the APAC ZIA data policy to add a direct NAT bypass for Microsoft 365 Optimize category (Teams, Exchange Online, SharePoint Online) using the SD-WAN SaaS optimisation feature.
+
+IMPLEMENTATION PLAN:
+1. In vManage: Configuration > Policies > Centralized Policy > APAC-ZIA-Internet-Breakout.
+2. Add a new sequence BEFORE the catch-all ZIA sequence:
+   seq: 5
+   match: application-family Microsoft-Optimize
+   action: nat outside (direct — no ZIA tunnel)
+3. Activate policy to APAC site list (site IDs: 2001, 2002, 2003, 2004).
+4. Confirm policy push successful in Monitor > Policies.
+
+ROLLBACK PLAN:
+Remove seq 5 from the policy and re-activate. ZIA inspection will resume for all O365 traffic.
+
+TEST PLAN:
+- From a Teams client at SGP-BR01, initiate a test call. Check media IP in Teams diagnostics (should show Microsoft PoP IP, not Zscaler IP).
+- Measure RTT improvement: target < 50 ms for Teams media.
+- Confirm email and SharePoint still accessible (not impacted by bypass).
+
+OUTCOME: Successful. Teams media RTT at SGP-BR01 improved from 320 ms to 38 ms. Zscaler bypass confirmed (media endpoint is Microsoft Singapore PoP 20.150.0.0/16).
+
+REFERENCES: DD-005, Microsoft 365 Network Connectivity Principles, Zscaler Direct Access guide

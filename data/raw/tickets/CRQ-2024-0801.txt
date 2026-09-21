@@ -1,0 +1,49 @@
+TICKET_ID: CRQ-2024-0801
+TITLE: BGP Timer Alignment on LON-DC01-RTR01 — BT MPLS Peer
+STATUS: Closed
+PRIORITY: Medium
+RISK_LEVEL: Low
+AFFECTED_DEVICE: LON-DC01-RTR01
+AFFECTED_SITE: LON-DC01
+CHANGE_DATE: 2024-08-01
+CHANGE_WINDOW: 2024-08-01 22:00 UTC – 2024-08-01 23:00 UTC
+REQUESTED_BY: Priya Nair
+APPROVED_BY: Sandra Lin
+IMPLEMENTED_BY: Tom Bradley
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+BGP keepalive and hold-timer values on LON-DC01-RTR01 are currently set to 60/180 seconds (keepalive/hold). During a recent BGP flap incident (INC-2024-0721), the hold timer duration of 180 seconds meant that a brief transport outage caused an extended BGP session disruption (3 minutes). The investigation identified that aligning timers to the Contoso standard (30/90) and enabling BFD fallover would improve failover time from ~3 minutes to sub-second.
+
+This change aligns BGP timers for the BT MPLS peer (172.16.0.1) and Lumen backup peer (172.16.1.1) with the Contoso standard. BFD fallover is also enabled.
+
+IMPLEMENTATION PLAN:
+1. SSH to LON-DC01-RTR01 (10.200.1.1 via jump host 10.200.5.1).
+2. Enter BGP configuration:
+   router bgp 65001
+    neighbor 172.16.0.1 timers 30 90
+    neighbor 172.16.0.1 fall-over bfd
+    neighbor 172.16.1.1 timers 30 90
+    neighbor 172.16.1.1 fall-over bfd
+3. Verify BGP sessions re-establish (soft reset not required for timer change — takes effect at next negotiation or session reset).
+4. Confirm BFD sessions are established: show bfd neighbors.
+5. Monitor BGP summary for 15 minutes.
+
+ROLLBACK PLAN:
+Revert BGP timers to previous values (60/180) and remove fall-over bfd:
+   router bgp 65001
+    neighbor 172.16.0.1 timers 60 180
+    no neighbor 172.16.0.1 fall-over bfd
+    neighbor 172.16.1.1 timers 60 180
+    no neighbor 172.16.1.1 fall-over bfd
+
+TEST PLAN:
+Post-change validation:
+- show ip bgp neighbors 172.16.0.1 | include Hold time|Keepalive
+- Confirm: Hold time = 90, Keepalive = 30
+- show bfd neighbors
+- Confirm BFD sessions in Up state for both peers
+
+OUTCOME: Successful. BGP sessions re-established with correct timers within 2 minutes. BFD sessions established. No traffic impact observed.
+
+REFERENCES: INC-2024-0721, DD-003, RB-001

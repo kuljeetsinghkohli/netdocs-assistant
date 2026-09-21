@@ -1,0 +1,43 @@
+TICKET_ID: CRQ-2024-0918
+TITLE: SD-WAN Data Policy Update — Zscaler ZIA Steering for New Branches
+STATUS: Closed
+PRIORITY: High
+RISK_LEVEL: Medium
+AFFECTED_DEVICE: vManage (all branch vEdge policies)
+AFFECTED_SITE: LON-BR10, LON-BR11, LON-BR12, LON-BR13
+CHANGE_DATE: 2024-09-18
+CHANGE_WINDOW: 2024-09-18 20:00 UTC – 2024-09-18 22:00 UTC
+REQUESTED_BY: Meera Patel
+APPROVED_BY: Alex Mercer
+IMPLEMENTED_BY: Meera Patel
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+Four recently deployed branch sites (LON-BR10 through LON-BR13) are currently backhauling internet traffic via LON-DC01 hub. This was intentional during initial deployment for traffic visibility and policy validation. Following 2 weeks of baselining, ZIA internet breakout policy is now ready to be pushed to these sites.
+
+This change pushes the ZIA-Internet-Breakout data policy to these four sites via vManage, enabling local internet breakout via biz-internet transport to the Frankfurt ZIA PoP.
+
+IMPLEMENTATION PLAN:
+1. Log in to vManage (https://10.200.0.20) as network-admin.
+2. Navigate to Configuration > Policies > Centralized Policy.
+3. Clone existing policy EMEA-ZIA-Internet-Breakout.
+4. Under Site List, add sites: 1010, 1011, 1012, 1013.
+5. Activate policy (select all vSmarts and push).
+6. Confirm policy is activated: Monitor > Policies > Centralized Policy Status.
+7. From each site, confirm internet traffic is now going via Zscaler (check outbound IP via https://ip.zscaler.com/).
+
+ROLLBACK PLAN:
+If internet access breaks at any site:
+1. Remove sites from the centralized policy Site List.
+2. Activate policy (push updated version).
+3. Verify backhauling resumes via LON-DC01 hub path.
+4. Investigate Zscaler tunnel status (RB-003 for tunnel issues).
+
+TEST PLAN:
+- From a browser at LON-BR13: browse to https://ip.zscaler.com/ — should show Zscaler gateway in Frankfurt.
+- Verify corporate traffic still flows via overlay: ping 10.10.0.10 from site workstation.
+- Check vManage app-route statistics for LON-BR13: internet traffic should show biz-internet colour.
+
+OUTCOME: Successful. All 4 sites now breaking out locally via ZIA. Backhaul internet traffic at LON-DC01 reduced by approximately 240 Mbps at peak.
+
+REFERENCES: DD-005, RB-003, Zscaler ZIA PoP selection: Frankfurt primary

@@ -1,0 +1,40 @@
+TICKET_ID: CRQ-2025-0201
+TITLE: Decommission Legacy MPLS Circuit at LON-BR05 (BT → Virgin Migration)
+STATUS: Planned
+PRIORITY: Medium
+RISK_LEVEL: Medium
+AFFECTED_DEVICE: LON-BR05-VE01
+AFFECTED_SITE: LON-BR05
+CHANGE_DATE: 2025-02-01
+CHANGE_WINDOW: 2025-02-01 08:00 UTC – 2025-02-01 12:00 UTC
+REQUESTED_BY: Sandra Lin
+APPROVED_BY: Alex Mercer
+IMPLEMENTED_BY: Sandra Lin (planned)
+TICKET_TYPE: Standard Change
+
+DESCRIPTION:
+LON-BR05 currently has BT MPLS (primary) and BT broadband (secondary). Contoso is migrating broadband to Virgin Media Business (better SLA, lower cost) and decommissioning the legacy BT MPLS circuit in favour of dual-broadband with SD-WAN transport independence. The Virgin Media circuit was provisioned in January 2025 and has been tested. This change migrates the secondary transport to Virgin Media and decommissions the BT MPLS.
+
+Post-migration state: LON-BR05 will use dual-broadband (Virgin Media primary + existing BT broadband secondary) with direct internet breakout via ZIA. Corporate traffic continues over the SD-WAN overlay.
+
+Note: MPLS transport at LON-BR05 is low-utilisation (< 5 Mbps average). The SD-WAN overlay over broadband provides equivalent performance for this site.
+
+IMPLEMENTATION PLAN:
+1. Pre-migration: Confirm Virgin Media circuit is up and ZIA is functional.
+2. In vManage, update LON-BR05 device template: change GigabitEthernet0 (currently MPLS colour) to biz-internet colour.
+3. Push template to LON-BR05-VE01.
+4. Validate traffic flows over Virgin Media biz-internet: check app-route stats.
+5. Remove BT MPLS interface configuration (set to shutdown in template).
+6. Notify BT NOC to terminate circuit BT-WAN-LON-005: +44 800 800 152.
+7. Return CPE modem to BT per decommission process.
+
+ROLLBACK PLAN:
+Revert vManage template to previous configuration (MPLS colour on GE0).
+Contact BT if circuit has already been terminated — no rollback possible after BT termination.
+
+TEST PLAN:
+- LON-BR05 corporate traffic flows over Virgin Media transport.
+- ZIA breakout functional (https://ip.zscaler.com/ from site browser).
+- BT MPLS circuit confirmed terminated in BT portal.
+
+REFERENCES: DD-001, DD-005, CRQ-2024-0701 (Virgin Media provisioning)
