@@ -1385,3 +1385,123 @@ class TestBGPRunbookRegression:
             expanded = _expand_query(q)
             assert expanded != q, f"No expansion for: {q!r}"
             assert "runbook" in expanded.lower() or "procedure" in expanded.lower()
+
+
+# ---------------------------------------------------------------------------
+# Regression test — RB-001 preamble-chunk fix (GitHub issue: Q01 refusal)
+#
+# Before the fix, "What is the runbook procedure when a BGP session flaps?"
+# retrieved chunk __000 (preamble: title + metadata, no steps) as top-1.
+# The LLM saw no actionable steps and refused with LOW_CONFIDENCE_ANSWER.
+#
+# After the fix the preamble chunk carries the step TOC, so both BGP-flap
+# query phrasings return a non-refused cited answer from RB-001.
+#
+# These tests use the *live* ChromaDB + BM25 + cross-encoder pipeline but
+# replace the LLM with ExtractiveClient so no API key is required.
+# They are marked ``live`` and skipped when the ChromaDB collection is empty
+# (e.g. CI environments without a pre-built index).
+# ---------------------------------------------------------------------------
+
+import pytest
+
+
+def _live_pipeline():
+    """Return (retriever, reranker) from the live index, or skip if empty."""
+    pytest.importorskip("sentence_transformers")
+    from netdocs.embeddings.embedder import get_embedder
+    from netdocs.retriever.vector_store import VectorStore
+    from netdocs.retriever.bm25_index import BM25Index
+    from netdocs.retriever.hybrid import HybridRetriever
+    from netdocs.retriever.reranker import get_reranker
+
+    store = VectorStore()
+    if store.count() == 0:
+        pytest.skip("ChromaDB collection is empty — run `python -m netdocs ingest` first")
+
+    embedder = get_embedder()
+    bm25 = BM25Index.load_or_build(store)
+    retriever = HybridRetriever(store, bm25, embedder)
+    reranker = get_reranker()
+    return retriever, reranker
+
+
+class TestBGPRunbookPreambleFix:
+    """Regression: both BGP-flap query phrasings must return a cited answer from RB-001.
+
+    Q01 ("What is the runbook procedure when a BGP session flaps?") was
+    previously refused because chunk __000 (preamble, no steps) ranked #1
+    and the LLM saw no actionable procedure.  The fix appends a step TOC
+    to __000 so even when it ranks first the LLM can produce a cited answer.
+
+    These tests exercise the *full retrieval+generation pipeline* with
+    ExtractiveClient (no real LLM call) against the live ChromaDB index.
+    """
+
+    @pytest.mark.parametrize("query", [
+        "What is the runbook procedure when a BGP session flaps?",   # Q01
+        "How do I diagnose a BGP flap?",                             # Q02
+    ])
+    def test_query_returns_non_refused_answer_citing_rb001(self, query):
+        """Both phrasings must produce a non-refused answer citing RB-001."""
+        from netdocs.retriever.hybrid import apply_doc_type_boost
+        from netdocs.llm.generator import generate_answer
+        from netdocs.llm.client import ExtractiveClient
+        from netdocs.config import settings
+
+        retriever, reranker = _live_pipeline()
+
+        candidates = retriever.retrieve(
+            query,
+            top_k=settings.retrieval_top_k * 4,
+            candidate_k=settings.retrieval_candidate_k,
+        )
+        top_chunks = reranker.rerank(query, candidates, top_k=settings.retrieval_top_k)
+        top_chunks = apply_doc_type_boost(top_chunks, query)
+
+        # Verify RB-001 appears in top-3 retrieved chunks
+        top3_sources = [
+            c.get("metadata", {}).get("source_file", "") for c in top_chunks[:3]
+        ]
+        assert any("RB-001_bgp_flap_diagnosis" in s for s in top3_sources), (
+            f"RB-001 not in top-3 for {query!r}\nGot: {top3_sources}"
+        )
+
+        # Verify the generator does not refuse
+        result = generate_answer(query, top_chunks, ExtractiveClient())
+        assert not result.refused, (
+            f"generate_answer refused for {query!r} "
+            f"(reason={result.refusal_reason!r}, confidence={result.confidence:.4f})"
+        )
+
+        # Verify at least one citation references RB-001
+        rb001_cited = any(
+            "RB-001_bgp_flap_diagnosis" in c.source_file
+            or "RB-001_bgp_flap_diagnosis" in c.doc_id
+            for c in result.citations
+        )
+        assert rb001_cited, (
+            f"No RB-001 citation in answer for {query!r}\n"
+            f"Citations: {[(c.doc_id, c.source_file) for c in result.citations]}"
+        )
+
+    def test_preamble_chunk_contains_step_toc(self):
+        """After fix, RB-001_bgp_flap_diagnosis__000 must contain 'Procedure steps:'."""
+        from netdocs.retriever.vector_store import VectorStore
+
+        store = VectorStore()
+        if store.count() == 0:
+            pytest.skip("ChromaDB collection is empty")
+
+        chunks = store.get_by_ids(["RB-001_bgp_flap_diagnosis__000"])
+        assert chunks, "Chunk RB-001_bgp_flap_diagnosis__000 not found in store"
+        text = chunks[0]["text"]
+        assert "Procedure steps:" in text, (
+            "Preamble chunk __000 does not contain step TOC.\n"
+            "Run `python -m netdocs ingest --reset` to rebuild the index."
+        )
+        # Should have at least steps 1–7
+        for step_n in range(1, 8):
+            assert f"{step_n}." in text, (
+                f"Step {step_n} missing from preamble TOC in __000"
+            )

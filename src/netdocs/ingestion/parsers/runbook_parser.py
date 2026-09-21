@@ -83,8 +83,41 @@ def _split_preserving_code_fences(
     return [c for c in chunks if c.strip()]
 
 
+def _build_step_toc(sections: list[tuple[int, str, str]]) -> str:
+    """Build a compact table-of-contents string listing numbered procedure steps.
+
+    Used to augment the preamble chunk so that when it ranks highest the LLM
+    can still see the full step sequence and cite the runbook.
+
+    Args:
+        sections: List of ``(level, heading_text, body_text)`` tuples from
+                  :func:`~netdocs.ingestion.parsers.prose_parser._extract_sections`.
+
+    Returns:
+        Newline-separated list of step headings, e.g.::
+
+            Procedure steps:
+            1. Confirm the Flap and Identify the Peer
+            2. Check Underlying Connectivity
+            ...
+    """
+    steps: list[str] = []
+    for _, heading_text, _ in sections:
+        m = _STEP_RE.match(heading_text)
+        if m:
+            steps.append(f"{m.group(1)}. {m.group(2).strip()}")
+    if not steps:
+        return ""
+    return "Procedure steps:\n" + "\n".join(steps)
+
+
 def parse_runbook(file_path: Path) -> list[Chunk]:
     """Parse a runbook Markdown file into step-level chunks.
+
+    The first chunk (index 000) is the document preamble (title, metadata,
+    prerequisites).  It is augmented with a compact table-of-contents of the
+    numbered procedure steps so that when it ranks highest in retrieval the LLM
+    still receives the full step outline and can produce a cited answer.
 
     Args:
         file_path: Path to the ``.md`` runbook file.
@@ -108,6 +141,10 @@ def parse_runbook(file_path: Path) -> list[Chunk]:
     sections = _extract_sections(text)
     chunk_size = settings.chunk_size_runbook
 
+    # Build step TOC once; injected into preamble chunks (step_number == 0
+    # and part_index == 0) so they remain useful when retrieved alone.
+    step_toc = _build_step_toc(sections)
+
     chunks: list[Chunk] = []
     chunk_idx = 0
     procedure_name = doc_title
@@ -130,9 +167,15 @@ def parse_runbook(file_path: Path) -> list[Chunk]:
             # encodes document-type semantics alongside the content.  This
             # makes phrasing like "runbook procedure" rank runbook chunks
             # higher even when the body text does not repeat those words.
+            #
+            # For preamble chunks (step_number == 0, part_index == 0) also
+            # append the step TOC so the LLM can produce a cited overview
+            # answer when this chunk ranks first.
+            is_preamble = step_number == 0 and part_idx == 0
+            toc_suffix = f"\n\n{step_toc}" if (is_preamble and step_toc) else ""
             combined = (
                 f"[DOC_TYPE: runbook] [SOURCE: {doc_title}]\n"
-                f"### {heading_text}\n\n{chunk_text}"
+                f"### {heading_text}\n\n{chunk_text}{toc_suffix}"
             )
             chunks.append(
                 Chunk(
