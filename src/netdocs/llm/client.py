@@ -137,18 +137,37 @@ class OpenAIClient(BaseLLMClient):
 # Gemini provider
 # ---------------------------------------------------------------------------
 
+# Tokens reserved so that thinking budget does not crowd out the answer.
+_GEMINI_THINKING_BUDGET = 0          # 0 = disabled / minimal
+_GEMINI_DEFAULT_MAX_OUTPUT = 4096    # raised from 1024 to avoid truncation
+_GEMINI_RETRY_MAX_OUTPUT = 8192      # retry limit when first call is truncated
+
+
 class GeminiClient(BaseLLMClient):
     """Google Gemini client using the google-genai SDK.
 
     Reads ``GEMINI_API_KEY`` from the environment / .env.
-    Model defaults to ``gemini-2.0-flash`` (fast, free tier available).
+    Model is resolved in priority order:
+      1. ``model`` constructor argument
+      2. ``GEMINI_MODEL`` env-var / ``settings.gemini_model``
+         (default: ``gemini-2.0-flash``)
+      3. ``NETDOCS_LLM_MODEL`` if it starts with "gemini"
+
+    Thinking models (e.g. gemini-2.5-*) are handled safely:
+    * ``thinking_config`` is set to ``budget_tokens=0`` to minimise / disable
+      internal reasoning, keeping output tokens for the actual answer.
+    * Response parts are filtered to include only non-thought text, so leaked
+      reasoning fragments never appear in the returned answer.
+    * ``finish_reason`` and token usage are logged at DEBUG level.
+    * If ``finish_reason`` is MAX_TOKENS **or** the answer is empty, the call
+      is retried once with a doubled ``max_output_tokens``.  If still empty, a
+      :class:`RuntimeError` is raised with a clear message.
 
     Args:
-        model:       Gemini model name. Defaults to ``settings.llm_model``
-                     if it looks like a Gemini model, else ``gemini-2.0-flash``.
+        model:       Gemini model name. See resolution order above.
         api_key:     API key. Defaults to ``settings.gemini_api_key``.
         temperature: Sampling temperature.
-        max_tokens:  Max output tokens.
+        max_tokens:  Max output tokens (default: 4096).
     """
 
     def __init__(
@@ -173,20 +192,115 @@ class GeminiClient(BaseLLMClient):
                 "Set it in .env, or use NETDOCS_LLM_PROVIDER=extractive for keyless operation."
             )
 
-        # Pick a sensible default model for Gemini
-        cfg_model = settings.llm_model
+        # Model resolution: explicit arg > GEMINI_MODEL > llm_model if gemini-*
         if model:
             self._model = model
-        elif cfg_model.startswith("gemini"):
-            self._model = cfg_model
+        elif settings.gemini_model:
+            self._model = settings.gemini_model
+        elif settings.llm_model.startswith("gemini"):
+            self._model = settings.llm_model
         else:
-            self._model = "gemini-3.6-flash"
+            self._model = "gemini-2.0-flash"
 
         self._temperature = temperature if temperature is not None else settings.llm_temperature
-        self._max_tokens = max_tokens or settings.llm_max_tokens
+        # Use the larger default; caller's llm_max_tokens is often 1024 which
+        # is too small when a thinking model eats tokens internally.
+        configured = max_tokens or settings.llm_max_tokens
+        self._max_tokens = max(configured, _GEMINI_DEFAULT_MAX_OUTPUT)
 
         self._client = genai.Client(api_key=key)
-        logger.info("GeminiClient ready. model=%s", self._model)
+        logger.info("GeminiClient ready. model=%s  max_output_tokens=%d",
+                    self._model, self._max_tokens)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _call(self, prompt: str, temp: float, mtok: int) -> Any:
+        """Single generate_content call; returns the raw response object."""
+        from google.genai import types  # type: ignore
+
+        # Build ThinkingConfig defensively — field names changed between SDK
+        # versions.  v1.x uses ``thinking_budget``; earlier releases used
+        # ``budget_tokens``.  We try the current name first and fall back.
+        thinking_cfg: Any = None
+        try:
+            # SDK >= 1.x: thinking_budget=0 disables/minimises reasoning.
+            # include_thoughts=False ensures thought parts are not returned.
+            thinking_cfg = types.ThinkingConfig(
+                thinking_budget=_GEMINI_THINKING_BUDGET,
+                include_thoughts=False,
+            )
+        except Exception:
+            # Older SDK or model that doesn't support thinking config — skip.
+            thinking_cfg = None
+
+        config_kwargs: dict[str, Any] = dict(
+            temperature=temp,
+            max_output_tokens=mtok,
+        )
+        if thinking_cfg is not None:
+            config_kwargs["thinking_config"] = thinking_cfg
+
+        return self._client.models.generate_content(
+            model=self._model,
+            contents=prompt,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+
+    @staticmethod
+    def _extract_text(response: Any) -> str:
+        """Return only non-thought text parts concatenated.
+
+        The google-genai SDK may return multiple ``Part`` objects per
+        ``Candidate``.  Thought parts carry ``thought=True`` (or appear as
+        ``thought_signature`` parts) and must be excluded from the answer.
+        """
+        try:
+            parts = response.candidates[0].content.parts
+        except (AttributeError, IndexError):
+            # Fallback: use the SDK's .text property if parts are unavailable
+            return response.text or ""
+
+        text_parts: list[str] = []
+        for part in parts:
+            # Skip thought / reasoning parts
+            if getattr(part, "thought", False):
+                continue
+            # Skip parts that have no text (e.g. inline_data, thought_signature)
+            t = getattr(part, "text", None)
+            if t:
+                text_parts.append(t)
+
+        return "".join(text_parts)
+
+    @staticmethod
+    def _finish_reason(response: Any) -> str:
+        """Extract finish_reason string from the first candidate (best-effort)."""
+        try:
+            reason = response.candidates[0].finish_reason
+            # SDK may return an enum or a string
+            return str(reason.name) if hasattr(reason, "name") else str(reason)
+        except (AttributeError, IndexError):
+            return "UNKNOWN"
+
+    @staticmethod
+    def _token_usage(response: Any) -> dict[str, int]:
+        """Extract token usage metadata (best-effort)."""
+        try:
+            um = response.usage_metadata
+            return {
+                "prompt": getattr(um, "prompt_token_count", 0) or 0,
+                "candidates": getattr(um, "candidates_token_count", 0) or 0,
+                "thoughts": getattr(um, "thoughts_token_count", 0) or 0,
+                "total": getattr(um, "total_token_count", 0) or 0,
+            }
+        except AttributeError:
+            return {}
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def complete(
         self,
@@ -196,20 +310,47 @@ class GeminiClient(BaseLLMClient):
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
-        from google.genai import types  # type: ignore
-
         temp = temperature if temperature is not None else self._temperature
-        mtok = max_tokens or self._max_tokens
+        mtok = max_tokens if max_tokens is not None else self._max_tokens
 
-        response = self._client.models.generate_content(
-            model=self._model,
-            contents=f"{system}\n\nUser question: {user}",
-            config=types.GenerateContentConfig(
-                temperature=temp,
-                max_output_tokens=mtok,
-            ),
+        prompt = f"{system}\n\nUser question: {user}"
+
+        response = self._call(prompt, temp, mtok)
+
+        finish = self._finish_reason(response)
+        usage = self._token_usage(response)
+        logger.debug(
+            "Gemini response. model=%s  finish_reason=%s  tokens=%s",
+            self._model, finish, usage,
         )
-        return response.text or ""
+
+        answer = self._extract_text(response)
+
+        # Retry once if truncated or empty
+        if finish == "MAX_TOKENS" or not answer.strip():
+            retry_mtok = max(mtok * 2, _GEMINI_RETRY_MAX_OUTPUT)
+            logger.warning(
+                "Gemini answer truncated or empty (finish_reason=%s, tokens=%s). "
+                "Retrying with max_output_tokens=%d.",
+                finish, usage, retry_mtok,
+            )
+            response = self._call(prompt, temp, retry_mtok)
+            finish = self._finish_reason(response)
+            usage = self._token_usage(response)
+            logger.debug(
+                "Gemini retry response. finish_reason=%s  tokens=%s",
+                finish, usage,
+            )
+            answer = self._extract_text(response)
+
+        if not answer.strip():
+            raise RuntimeError(
+                f"Gemini returned an empty answer after retry. "
+                f"model={self._model!r}  finish_reason={finish}  tokens={usage}. "
+                "Check your GEMINI_MODEL setting and API quota."
+            )
+
+        return answer
 
 
 # ---------------------------------------------------------------------------

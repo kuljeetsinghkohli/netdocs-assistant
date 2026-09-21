@@ -15,8 +15,16 @@ import argparse
 import logging
 import sys
 import time
+import warnings
 from collections import Counter
 from pathlib import Path
+
+# Suppress noisy warnings that appear before logging is configured.
+# These must be installed before google-auth / urllib3 are first imported.
+warnings.filterwarnings("ignore", category=Warning, module=r"urllib3")
+warnings.filterwarnings("ignore", message=r".*OpenSSL.*")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"google\.auth")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"google\.oauth2")
 
 from rich.console import Console
 from rich.table import Table
@@ -34,8 +42,25 @@ def _configure_logging(level: str) -> None:
         datefmt="%H:%M:%S",
     )
     # Suppress noisy third-party loggers
-    for noisy in ("httpx", "httpcore", "sentence_transformers", "chromadb"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    for noisy in (
+        "httpx",
+        "httpcore",
+        "sentence_transformers",
+        "chromadb",
+        "urllib3",
+        "google.auth",
+        "google.auth.transport",
+        "google_auth_httplib2",
+    ):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
+
+    # Suppress urllib3 NotOpenSSLWarning and google-auth FutureWarning at the
+    # warnings module level so they never reach stderr.
+    import warnings
+    warnings.filterwarnings("ignore", category=Warning, module=r"urllib3")
+    warnings.filterwarnings("ignore", category=FutureWarning, module=r"google\.auth")
+    warnings.filterwarnings("ignore", message=r".*OpenSSL.*", category=Warning)
+    warnings.filterwarnings("ignore", message=r".*urllib3.*", category=Warning)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -269,9 +294,12 @@ def cmd_ask(args: argparse.Namespace) -> int:
     from netdocs.llm.client import get_llm_client
     from netdocs.llm.generator import generate_answer
 
+    from netdocs.llm.client import _resolve_provider
+
     console.rule("[bold cyan]NetDocs Ask")
     console.print(f"  Question : [bold]{args.question}[/]")
-    console.print(f"  Provider : [green]{settings.llm_provider} / {settings.llm_model}[/]")
+    effective_provider = _resolve_provider()
+    console.print(f"  Provider : [green]{effective_provider} / {settings.llm_model}[/]")
 
     # Build filters
     filters: dict = {}

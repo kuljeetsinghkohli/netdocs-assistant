@@ -75,6 +75,16 @@ class Settings(BaseSettings):
             "For Gemini use e.g. 'gemini-2.0-flash' or 'gemini-1.5-pro'."
         ),
     )
+    # GEMINI_MODEL overrides llm_model when the Gemini provider is active.
+    # Defaults to gemini-3.6-flash (fast, non-thinking, production-available).
+    gemini_model: str = Field(
+        default="gemini-3.6-flash",
+        alias="GEMINI_MODEL",
+        description=(
+            "Gemini model name. Overrides NETDOCS_LLM_MODEL when provider=gemini. "
+            "Set to a non-thinking model to avoid thought-token leakage."
+        ),
+    )
     llm_temperature: float = Field(
         default=0.0,
         description="Sampling temperature (0 = deterministic).",

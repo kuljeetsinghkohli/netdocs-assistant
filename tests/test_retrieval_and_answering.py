@@ -809,3 +809,213 @@ class TestExtractiveClient:
         assert len(result.citations) >= 1
         assert result.citations[0].doc_id == "DD-003__002"
 
+
+
+# ---------------------------------------------------------------------------
+# Tests: GeminiClient — offline (no real API calls)
+# ---------------------------------------------------------------------------
+
+class _FakePart:
+    """Minimal stand-in for a google.genai Part."""
+    def __init__(self, text: str | None = None, thought: bool = False) -> None:
+        self.text = text
+        self.thought = thought
+
+
+class _FakeFinishReason:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeCandidate:
+    def __init__(self, parts: list, finish_reason_name: str = "STOP") -> None:
+        self.content = type("Content", (), {"parts": parts})()
+        self.finish_reason = _FakeFinishReason(finish_reason_name)
+
+
+class _FakeUsage:
+    def __init__(self, prompt=10, candidates=20, thoughts=5, total=35) -> None:
+        self.prompt_token_count = prompt
+        self.candidates_token_count = candidates
+        self.thoughts_token_count = thoughts
+        self.total_token_count = total
+
+
+class _FakeResponse:
+    def __init__(self, candidates: list, usage: "_FakeUsage | None" = None) -> None:
+        self.candidates = candidates
+        self.usage_metadata = usage or _FakeUsage()
+        # .text is what the real SDK exposes; we set it to the first text part
+        # for fallback testing, but _extract_text should not use it.
+        self.text = None
+
+
+class TestGeminiClientHelpers:
+    """Unit-test the static helper methods of GeminiClient — no API key needed."""
+
+    def _client_obj(self):
+        """Return a bare GeminiClient instance with __init__ bypassed."""
+        from netdocs.llm.client import GeminiClient
+        obj = object.__new__(GeminiClient)
+        obj._model = "gemini-2.0-flash"
+        obj._temperature = 0.0
+        obj._max_tokens = 4096
+        return obj
+
+    # --- _extract_text -------------------------------------------------
+
+    def test_extract_text_skips_thought_parts(self):
+        from netdocs.llm.client import GeminiClient
+
+        parts = [
+            _FakePart(text="think about it", thought=True),
+            _FakePart(text="The real answer.", thought=False),
+        ]
+        response = _FakeResponse([_FakeCandidate(parts)])
+        result = GeminiClient._extract_text(response)
+        assert result == "The real answer."
+        assert "think about it" not in result
+
+    def test_extract_text_skips_non_text_parts(self):
+        """Parts with no .text (e.g. thought_signature) must be skipped."""
+        from netdocs.llm.client import GeminiClient
+
+        parts = [
+            _FakePart(text=None, thought=False),   # thought_signature-like
+            _FakePart(text="Answer here.", thought=False),
+        ]
+        response = _FakeResponse([_FakeCandidate(parts)])
+        result = GeminiClient._extract_text(response)
+        assert result == "Answer here."
+
+    def test_extract_text_concatenates_multiple_text_parts(self):
+        from netdocs.llm.client import GeminiClient
+
+        parts = [
+            _FakePart(text="Part one. ", thought=False),
+            _FakePart(text="Part two.", thought=False),
+        ]
+        response = _FakeResponse([_FakeCandidate(parts)])
+        result = GeminiClient._extract_text(response)
+        assert result == "Part one. Part two."
+
+    def test_extract_text_fallback_when_no_candidates(self):
+        """If candidates list is empty, fall back to response.text."""
+        from netdocs.llm.client import GeminiClient
+
+        response = _FakeResponse([])
+        response.text = "fallback text"
+        result = GeminiClient._extract_text(response)
+        assert result == "fallback text"
+
+    def test_extract_text_all_thought_returns_empty(self):
+        """If every part is a thought, the extracted text should be empty."""
+        from netdocs.llm.client import GeminiClient
+
+        parts = [
+            _FakePart(text="Wait! Could I answer with the specific step?", thought=True),
+        ]
+        response = _FakeResponse([_FakeCandidate(parts)])
+        result = GeminiClient._extract_text(response)
+        assert result == ""
+
+    # --- _finish_reason ------------------------------------------------
+
+    def test_finish_reason_stop(self):
+        from netdocs.llm.client import GeminiClient
+
+        response = _FakeResponse([_FakeCandidate([], "STOP")])
+        assert GeminiClient._finish_reason(response) == "STOP"
+
+    def test_finish_reason_max_tokens(self):
+        from netdocs.llm.client import GeminiClient
+
+        response = _FakeResponse([_FakeCandidate([], "MAX_TOKENS")])
+        assert GeminiClient._finish_reason(response) == "MAX_TOKENS"
+
+    def test_finish_reason_no_candidates(self):
+        from netdocs.llm.client import GeminiClient
+
+        response = _FakeResponse([])
+        assert GeminiClient._finish_reason(response) == "UNKNOWN"
+
+    # --- _token_usage --------------------------------------------------
+
+    def test_token_usage_populated(self):
+        from netdocs.llm.client import GeminiClient
+
+        response = _FakeResponse([], usage=_FakeUsage(10, 20, 5, 35))
+        usage = GeminiClient._token_usage(response)
+        assert usage["prompt"] == 10
+        assert usage["candidates"] == 20
+        assert usage["thoughts"] == 5
+        assert usage["total"] == 35
+
+    # --- complete() with MAX_TOKENS retry (monkey-patched) -------------
+
+    def test_complete_retries_on_max_tokens(self):
+        """complete() must retry once when finish_reason is MAX_TOKENS."""
+        from netdocs.llm.client import GeminiClient
+
+        call_count = [0]
+
+        def fake_call(prompt, temp, mtok):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First call: MAX_TOKENS with empty answer
+                return _FakeResponse(
+                    [_FakeCandidate([], "MAX_TOKENS")],
+                    _FakeUsage(),
+                )
+            else:
+                # Second (retry) call: STOP with real answer
+                return _FakeResponse(
+                    [_FakeCandidate([_FakePart("The full answer.", False)], "STOP")],
+                    _FakeUsage(),
+                )
+
+        client = self._client_obj()
+        client._call = fake_call  # type: ignore[assignment]
+
+        result = client.complete("system prompt", "user question")
+        assert result == "The full answer."
+        assert call_count[0] == 2
+
+    def test_complete_raises_after_two_empty_responses(self):
+        """After two consecutive empty answers, a RuntimeError must be raised."""
+        from netdocs.llm.client import GeminiClient
+
+        def fake_call(prompt, temp, mtok):
+            return _FakeResponse(
+                [_FakeCandidate([_FakePart(text=None, thought=False)], "MAX_TOKENS")],
+                _FakeUsage(),
+            )
+
+        client = self._client_obj()
+        client._call = fake_call  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError, match="empty answer after retry"):
+            client.complete("sys", "user")
+
+    def test_complete_filters_thought_parts_from_answer(self):
+        """Thought parts must never appear in the returned answer."""
+        from netdocs.llm.client import GeminiClient
+
+        def fake_call(prompt, temp, mtok):
+            parts = [
+                _FakePart("Wait! Could I answer with the specific step present, "
+                           "or is it mandatory to", thought=True),
+                _FakePart("1. Re-add the removed route-map clauses.", thought=False),
+            ]
+            return _FakeResponse(
+                [_FakeCandidate(parts, "STOP")],
+                _FakeUsage(),
+            )
+
+        client = self._client_obj()
+        client._call = fake_call  # type: ignore[assignment]
+
+        result = client.complete("sys", "user")
+        assert "Wait" not in result
+        assert "Could I" not in result
+        assert "Re-add the removed route-map clauses" in result
