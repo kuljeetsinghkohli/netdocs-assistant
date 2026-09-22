@@ -61,6 +61,16 @@ Network engineers and NOC analysts spend disproportionate time hunting through d
   GET  /health
 ```
 
+### Chunking strategy
+
+Chunking is structure-aware and specific to each document type, not a fixed-size sliding window:
+
+- **Configs** (`configs/`) — parsed line-by-line against real IOS-XE and vEdge/Viptela syntax (`interface`, `router bgp/ospf/isis/rip/eigrp`, `route-map`, `ip prefix-list/community-list/access-list/vrf`, `policy-map`, `class-map`, `vrf definition`, `crypto ikev2/ipsec/keyring/pki`, `vpn <n>`, `system`, `omp`, `sdwan`, `bfd`, `ntp`, `aaa`). Each top-level block (an interface, a routing process, a VRF, ...) becomes exactly one chunk and is never split internally. Global commands outside any block (hostname, logging, ...) are collected into a preamble chunk, and near-empty or comment-only blocks are dropped. Metadata carries `device_name`, `block_type`, `block_name`, `block_index`, and a `site_id` inferred from hyphenated device naming (e.g. `LON-DC01-RTR01` → `LON-DC01`).
+- **Runbooks** (`runbooks/`) — each H2/H3 procedure step becomes its own chunk. A section that exceeds the chunk-size budget is split at paragraph boundaries, never inside a fenced code block, so a multi-line CLI snippet always stays intact in one chunk. The first chunk of every runbook has a compact step table-of-contents appended, so if that chunk is the one retrieval surfaces, the LLM still sees the full procedure sequence and can cite the correct step. Metadata carries `runbook_id`, `procedure_name`, `step_number`, and a `device_role` inferred from the title (bgp → hub_router, ospf → dc_router, omp/tunnel/vedge/ztp → vedge, vmanage/cert → vmanage).
+- **Design docs and tickets** — parsed as prose and chunked on heading/paragraph boundaries.
+
+Every chunk is prefixed with `[DOC_TYPE: <type>] [SOURCE: <title>]` before embedding, so the retriever and reranker always know which document family and source a chunk came from.
+
 ### Component table
 
 | Component | Technology | Notes |
